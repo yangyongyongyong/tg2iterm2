@@ -4,65 +4,61 @@
 
 ## 架构
 
-```plantuml
-@startuml
-skinparam componentStyle rectangle
-skinparam defaultTextAlignment center
-
-actor "用户" as user
-component "Telegram" as tg
-
-package "tg2iterm2 Bot" {
-  component "telegram_client" as tc
-  component "bot_app\n(消息路由 / 模式切换)" as bot
-  component "iterm_controller\n(iTerm2 Python API)" as iterm
-  component "HTTP API\n(curl 接口)" as api
-
-  package "adapters" {
-    component "claude_adapter" as ca
-    component "cursor_adapter" as cua
-    component "shell_adapter" as sa
-  }
-
-  package "hooks" {
-    component "permission_bridge\n(文件 IPC)" as pb
-    component "claude_hook" as ch
-    component "cursor_hook" as cuh
-  }
-}
-
-component "iTerm2" as it
-component "Claude CLI" as claude
-component "Cursor CLI" as cursor
-
-user --> tg : 发消息
-tg --> tc : HTTP Long Polling
-tc --> bot : 路由分发
-bot --> iterm : 发送/读取终端
-bot ..> ca : Claude 模式
-bot ..> cua : Cursor 模式
-bot ..> sa : Shell 模式
-iterm --> it : Python API
-it --> claude : 交互式会话
-it --> cursor : 交互式会话
-
-claude --> ch : PermissionRequest
-cursor --> cuh : preToolUse / stop
-ch --> pb : 写请求文件
-cuh --> pb : 写请求文件
-pb --> bot : 轮询文件
-bot --> tc : InlineKeyboard\n权限按钮
-tc --> tg : 发送按钮
-user --> tg : 点击按钮
-tg --> tc : CallbackQuery
-tc --> bot : 处理审批
-bot --> pb : 写响应文件
-pb --> ch : 读响应
-pb --> cuh : 读响应
-
-api --> bot : curl POST
-bot --> tc : 转发消息
-@enduml
+```mermaid
+flowchart TB
+    User["👤 用户"]
+    TG["Telegram"]
+    
+    subgraph Bot["tg2iterm2 Bot"]
+        TC["telegram_client"]
+        BotApp["bot_app<br/>(消息路由 / 模式切换)"]
+        ItermCtrl["iterm_controller<br/>(iTerm2 Python API)"]
+        HTTP["HTTP API<br/>(curl 接口)"]
+        
+        subgraph Adapters["adapters"]
+            CA["claude_adapter"]
+            CUA["cursor_adapter"]
+            SA["shell_adapter"]
+        end
+        
+        subgraph Hooks["hooks"]
+            PB["permission_bridge<br/>(文件 IPC)"]
+            CH["claude_hook"]
+            CUH["cursor_hook"]
+        end
+    end
+    
+    iTerm2["iTerm2"]
+    ClaudeCLI["Claude CLI"]
+    CursorCLI["Cursor CLI"]
+    
+    User -->|"发消息"| TG
+    TG -->|"HTTP Long Polling"| TC
+    TC -->|"路由分发"| BotApp
+    BotApp -->|"发送/读取终端"| ItermCtrl
+    BotApp -.->|"Claude 模式"| CA
+    BotApp -.->|"Cursor 模式"| CUA
+    BotApp -.->|"Shell 模式"| SA
+    ItermCtrl -->|"Python API"| iTerm2
+    iTerm2 -->|"交互式会话"| ClaudeCLI
+    iTerm2 -->|"交互式会话"| CursorCLI
+    
+    ClaudeCLI -->|"PermissionRequest"| CH
+    CursorCLI -->|"preToolUse / stop"| CUH
+    CH -->|"写请求文件"| PB
+    CUH -->|"写请求文件"| PB
+    PB -->|"轮询文件"| BotApp
+    BotApp -->|"InlineKeyboard<br/>权限按钮"| TC
+    TC -->|"发送按钮"| TG
+    User -->|"点击按钮"| TG
+    TG -->|"CallbackQuery"| TC
+    TC -->|"处理审批"| BotApp
+    BotApp -->|"写响应文件"| PB
+    PB -->|"读响应"| CH
+    PB -->|"读响应"| CUH
+    
+    HTTP -->|"curl POST"| BotApp
+    BotApp -->|"转发消息"| TC
 ```
 
 ### 数据流
