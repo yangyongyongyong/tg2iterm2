@@ -12,6 +12,7 @@ from typing import Any, Callable, Awaitable
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 from reminder.models import Reminder
@@ -289,6 +290,30 @@ class ReminderManager:
                 exclude_months=config.get("exclude_months", []),
             )
 
+        if trigger_type == "interval":
+            kwargs: dict[str, Any] = {
+                "weeks": config.get("weeks", 0),
+                "days": config.get("days", 0),
+                "hours": config.get("hours", 0),
+                "minutes": config.get("minutes", 0),
+                "seconds": config.get("seconds", 0),
+            }
+            if config.get("timezone") is not None:
+                kwargs["timezone"] = config.get("timezone")
+            if config.get("jitter") is not None:
+                kwargs["jitter"] = config.get("jitter")
+            sd = config.get("start_date")
+            if sd is not None:
+                if isinstance(sd, str):
+                    sd = datetime.fromisoformat(sd)
+                kwargs["start_date"] = sd
+            ed = config.get("end_date")
+            if ed is not None:
+                if isinstance(ed, str):
+                    ed = datetime.fromisoformat(ed)
+                kwargs["end_date"] = ed
+            return IntervalTrigger(**kwargs)
+
         raise ValueError(f"不支持的触发器类型: {trigger_type}")
 
     async def add_reminder(
@@ -304,7 +329,7 @@ class ReminderManager:
         Args:
             chat_id: Telegram Chat ID
             content: 提醒内容
-            trigger_type: 触发器类型 (date / cron / nth_weekday)
+            trigger_type: 触发器类型 (date / cron / nth_weekday / interval)
             trigger_config: 触发器配置
 
         Returns:
@@ -450,6 +475,14 @@ class ReminderManager:
         """获取提醒数量。"""
         return len(self.get_all_reminders(chat_id, active_only))
 
+    def get_completed_reminders(self, chat_id: int | None = None) -> list[Reminder]:
+        """获取已完成/已过期的提醒（按触发时间倒序）。"""
+        reminders = list(self._reminders.values())
+        if chat_id is not None:
+            reminders = [r for r in reminders if r.chat_id == chat_id]
+        reminders = [r for r in reminders if r.triggered or r.expired]
+        return sorted(reminders, key=lambda r: r.triggered_at or r.created_at, reverse=True)
+
     async def mark_triggered(self, reminder_id: str) -> bool:
         """标记提醒为已触发。"""
         async with self._lock:
@@ -486,6 +519,17 @@ class ReminderManager:
                 pass
             
             await self._update_reminder_in_db(reminder)
+            return True
+
+    async def update_reminder_info(self, reminder_id: str, info: str) -> bool:
+        """更新提醒的备注信息。"""
+        async with self._lock:
+            if reminder_id not in self._reminders:
+                return False
+            
+            reminder = self._reminders[reminder_id]
+            reminder.info = info
+            await self._save_reminder_record(reminder)
             return True
 
     async def _update_reminder_in_db(self, reminder: Reminder) -> None:

@@ -39,6 +39,7 @@ class SessionMode(Enum):
     REMINDER = "reminder"  # 提醒模式
     REMINDER_CREATE = "reminder_create"  # 创建提醒子模式
     REMINDER_EDIT = "reminder_edit"  # 编辑提醒子模式
+    REMINDER_ADD_INFO = "reminder_add_info"  # 添加备注子模式
 
 
 HELP_TEXT = """tg2iterm2 已连接。
@@ -129,6 +130,7 @@ class Tg2ITermApp:
         self._reminder_parser: ReminderParser | None = None
         self._reminder_handlers: ReminderHandlers | None = None
         self._reminder_editing_id: str | None = None  # 当前正在编辑的提醒 ID
+        self._pending_reminder_info_id: str | None = None  # 等待添加备注的提醒 ID
         self._pending_reminder_creation: bool = False  # 是否有待处理的提醒创建
 
     @property
@@ -402,12 +404,15 @@ class Tg2ITermApp:
         if self._session_mode == SessionMode.REMINDER_EDIT:
             await self._handle_reminder_edit_input(chat_id, stripped)
             return
+        if self._session_mode == SessionMode.REMINDER_ADD_INFO:
+            await self._handle_reminder_add_info_input(chat_id, stripped)
+            return
         if self._session_mode == SessionMode.REMINDER:
             # 提醒模式下，文本命令处理
             await self._handle_reminder_mode_input(chat_id, stripped)
             return
         if stripped == "/exit":
-            if self._session_mode in (SessionMode.REMINDER, SessionMode.REMINDER_CREATE, SessionMode.REMINDER_EDIT):
+            if self._session_mode in (SessionMode.REMINDER, SessionMode.REMINDER_CREATE, SessionMode.REMINDER_EDIT, SessionMode.REMINDER_ADD_INFO):
                 await self._exit_reminder_mode(chat_id)
             else:
                 await self._exit_cli_mode(chat_id)
@@ -575,6 +580,7 @@ class Tg2ITermApp:
         """退出提醒模式。"""
         self._session_mode = SessionMode.SHELL
         self._reminder_editing_id = None
+        self._pending_reminder_info_id = None
         await self._telegram.send_message(chat_id, "已退出提醒模式")
 
     async def _handle_reminder_mode_input(self, chat_id: int, text: str) -> None:
@@ -597,6 +603,11 @@ class Tg2ITermApp:
             "正在通过 Cursor CLI 解析您的提醒请求...",
         )
 
+        # 记录创建前的提醒 ID，用于识别新创建的提醒
+        before_ids = {
+            r.id for r in self._reminder_manager.get_all_reminders(chat_id, active_only=False)
+        }
+
         # 直接调用 Cursor CLI（后台静默执行）
         result = await self._reminder_parser.parse_and_create(text, chat_id)
 
@@ -606,12 +617,29 @@ class Tg2ITermApp:
             if "成功" in output or "已创建" in output or "reminder_id" in output.lower() or "reminder" in output.lower():
                 # 重新从数据库加载提醒（同步外部创建的提醒）
                 await self._reminder_manager.reload_reminders()
-                await self._telegram.send_message(
-                    chat_id,
-                    f"✅ 提醒创建成功\n\n{output}",
-                )
-                # 显示提醒列表
-                await self._reminder_handlers.send_reminder_list(chat_id)
+
+                # 找出新创建的提醒
+                new_reminders = [
+                    r for r in self._reminder_manager.get_all_reminders(chat_id, active_only=False)
+                    if r.id not in before_ids
+                ]
+                if new_reminders:
+                    newest = max(new_reminders, key=lambda r: r.created_at)
+                    self._pending_reminder_info_id = newest.id
+                    self._session_mode = SessionMode.REMINDER_ADD_INFO
+                    await self._telegram.send_message(
+                        chat_id,
+                        f"✅ 提醒创建成功\n\n"
+                        f"📌 {newest.content}\n"
+                        f"⏰ {newest.get_human_readable_schedule()}\n\n"
+                        f"如需添加备注信息请直接输入，发送 /skip 跳过。",
+                    )
+                else:
+                    await self._telegram.send_message(
+                        chat_id,
+                        f"✅ 提醒创建成功\n\n{output}",
+                    )
+                    await self._reminder_handlers.send_reminder_list(chat_id)
             else:
                 await self._telegram.send_message(
                     chat_id,
@@ -628,6 +656,32 @@ class Tg2ITermApp:
                 chat_id,
                 "请重新描述您的提醒，或发送 /exit 退出",
             )
+
+    async def _handle_reminder_add_info_input(self, chat_id: int, text: str) -> None:
+        """处理添加备注信息时的文本输入。"""
+        if text == "/exit":
+            self._session_mode = SessionMode.REMINDER
+            self._pending_reminder_info_id = None
+            await self._reminder_handlers.send_reminder_menu(chat_id)
+            return
+
+        if text == "/skip":
+            self._session_mode = SessionMode.REMINDER
+            self._pending_reminder_info_id = None
+            await self._reminder_handlers.send_reminder_list(chat_id)
+            return
+
+        if not self._pending_reminder_info_id:
+            await self._telegram.send_message(chat_id, "添加备注会话已失效")
+            self._session_mode = SessionMode.REMINDER
+            return
+
+        await self._reminder_handlers.handle_add_info(
+            chat_id, self._pending_reminder_info_id, text
+        )
+        self._session_mode = SessionMode.REMINDER
+        self._pending_reminder_info_id = None
+        await self._reminder_handlers.send_reminder_list(chat_id)
 
     async def _handle_reminder_edit_input(self, chat_id: int, text: str) -> None:
         """处理编辑提醒时的文本输入。"""
@@ -678,6 +732,11 @@ class Tg2ITermApp:
             await self._telegram.answer_callback_query(callback_id)
             return
 
+        if action == "completed":
+            await self._reminder_handlers.send_completed_list(chat_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
         if action == "exit":
             await self._exit_reminder_mode(chat_id)
             await self._telegram.answer_callback_query(callback_id)
@@ -685,7 +744,11 @@ class Tg2ITermApp:
 
         if action == "detail" and len(parts) > 2:
             reminder_id = parts[2]
-            await self._reminder_handlers.send_reminder_detail(chat_id, reminder_id)
+            reminder = self._reminder_manager.get_reminder(reminder_id)
+            if reminder and (reminder.triggered or reminder.expired):
+                await self._reminder_handlers.send_completed_detail(chat_id, reminder_id)
+            else:
+                await self._reminder_handlers.send_reminder_detail(chat_id, reminder_id)
             await self._telegram.answer_callback_query(callback_id)
             return
 

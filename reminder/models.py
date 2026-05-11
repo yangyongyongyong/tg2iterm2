@@ -22,6 +22,7 @@ class Reminder:
     triggered: bool = False  # 是否已触发
     expired: bool = False  # 是否已过期（错过触发时间）
     triggered_at: datetime | None = None  # 实际触发时间
+    info: str = ""  # 用户备注信息
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -38,6 +39,7 @@ class Reminder:
             "triggered": self.triggered,
             "expired": self.expired,
             "triggered_at": self.triggered_at.isoformat() if self.triggered_at else None,
+            "info": self.info,
             "metadata": self.metadata,
         }
 
@@ -56,6 +58,7 @@ class Reminder:
             triggered=data.get("triggered", False),
             expired=data.get("expired", False),
             triggered_at=datetime.fromisoformat(data["triggered_at"]) if data.get("triggered_at") else None,
+            info=data.get("info", ""),
             metadata=data.get("metadata", {}),
         )
 

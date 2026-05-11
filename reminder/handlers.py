@@ -43,6 +43,25 @@ class ReminderHandlers:
         reply_markup = {"inline_keyboard": keyboard}
         await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
 
+    async def send_completed_list(self, chat_id: int) -> None:
+        """发送已完成提醒列表。"""
+        reminders = self._reminder_manager.get_completed_reminders(chat_id)
+        text = reminder_ui.format_completed_reminders(reminders)
+        keyboard = reminder_ui.build_completed_list_keyboard(reminders)
+        reply_markup = {"inline_keyboard": keyboard}
+        await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
+
+    async def send_completed_detail(self, chat_id: int, reminder_id: str) -> None:
+        """发送已完成提醒详情。"""
+        reminder = self._reminder_manager.get_reminder(reminder_id)
+        if not reminder:
+            await self._telegram.send_message(chat_id, "提醒不存在")
+            return
+        text = reminder_ui.format_reminder_detail(reminder)
+        keyboard = reminder_ui.build_completed_detail_keyboard(reminder)
+        reply_markup = {"inline_keyboard": keyboard}
+        await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
+
     async def send_reminder_detail(self, chat_id: int, reminder_id: str) -> None:
         """发送提醒详情。"""
         reminder = self._reminder_manager.get_reminder(reminder_id)
@@ -184,11 +203,24 @@ class ReminderHandlers:
         await self._telegram.send_message(chat_id, "更新失败")
         return False
 
+    async def handle_add_info(self, chat_id: int, reminder_id: str, info: str) -> bool:
+        """为提醒添加备注信息。"""
+        success = await self._reminder_manager.update_reminder_info(reminder_id, info)
+        if success:
+            reminder = self._reminder_manager.get_reminder(reminder_id)
+            await self._telegram.send_message(
+                chat_id,
+                f"✅ 备注已添加\n\n📌 {reminder.content}\n📝 {info}",
+            )
+        else:
+            await self._telegram.send_message(chat_id, "添加备注失败")
+        return success
+
     async def on_reminder_triggered(self, reminder: Reminder) -> None:
         """提醒触发时的回调。"""
         print(f"[Reminder] 触发提醒: {reminder.id} - {reminder.content} -> chat_id: {reminder.chat_id}")
-        await self._telegram.send_message(
-            reminder.chat_id,
-            f"⏰ 提醒：{reminder.content}",
-        )
+        text = f"⏰ 提醒：{reminder.content}"
+        if reminder.info:
+            text += f"\n\n📝 备注：{reminder.info}"
+        await self._telegram.send_message(reminder.chat_id, text)
         print(f"[Reminder] 消息已发送")
