@@ -475,6 +475,32 @@ class ReminderManager:
         """获取提醒数量。"""
         return len(self.get_all_reminders(chat_id, active_only))
 
+    def get_next_fire_times(self, reminder_id: str, count: int = 3) -> list[datetime]:
+        """获取提醒接下来 N 次的触发时间。"""
+        reminder = self._reminders.get(reminder_id)
+        if not reminder:
+            return []
+        try:
+            trigger = self._build_trigger(reminder.trigger_type, reminder.trigger_config)
+        except Exception:
+            return []
+        times: list[datetime] = []
+        prev: datetime | None = None
+        now = datetime.now()
+        for _ in range(count):
+            try:
+                next_time = trigger.get_next_fire_time(prev, now)
+            except Exception:
+                break
+            if next_time is None:
+                break
+            # 统一去掉时区信息，方便后续展示
+            if next_time.tzinfo is not None:
+                next_time = next_time.astimezone().replace(tzinfo=None)
+            times.append(next_time)
+            prev = next_time
+        return times
+
     def get_completed_reminders(self, chat_id: int | None = None) -> list[Reminder]:
         """获取已完成/已过期的提醒（按触发时间倒序）。"""
         reminders = list(self._reminders.values())

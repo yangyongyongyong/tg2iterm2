@@ -38,8 +38,12 @@ class ReminderHandlers:
     async def send_reminder_list(self, chat_id: int) -> None:
         """发送提醒列表。"""
         reminders = self._reminder_manager.get_all_reminders(chat_id)
-        text = reminder_ui.format_reminder_list(reminders)
-        keyboard = reminder_ui.build_reminder_list_keyboard(reminders)
+        next_times_map = {
+            r.id: self._reminder_manager.get_next_fire_times(r.id, count=3)
+            for r in reminders
+        }
+        text = reminder_ui.format_reminder_list(reminders, next_times_map)
+        keyboard = reminder_ui.build_reminder_list_keyboard(reminders, next_times_map)
         reply_markup = {"inline_keyboard": keyboard}
         await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
 
@@ -68,7 +72,8 @@ class ReminderHandlers:
         if not reminder:
             await self._telegram.send_message(chat_id, "提醒不存在")
             return
-        text = reminder_ui.format_reminder_detail(reminder)
+        next_times = self._reminder_manager.get_next_fire_times(reminder_id, count=3)
+        text = reminder_ui.format_reminder_detail(reminder, next_times)
         keyboard = reminder_ui.build_reminder_detail_keyboard(reminder)
         reply_markup = {"inline_keyboard": keyboard}
         await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)

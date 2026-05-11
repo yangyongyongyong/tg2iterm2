@@ -3,8 +3,19 @@
 from __future__ import annotations
 
 from typing import Any
+from datetime import datetime
 
 from reminder.models import Reminder
+
+
+def _fmt_times(times: list[datetime]) -> str:
+    """把 datetime 列表格式化为 mm-dd HH:MM 字符串。"""
+    if not times:
+        return ""
+    parts = [t.strftime("%m-%d %H:%M") for t in times]
+    if len(parts) == 1:
+        return parts[0]
+    return " / ".join(parts)
 
 
 def build_main_menu_keyboard() -> list[list[dict[str, Any]]]:
@@ -22,24 +33,33 @@ def build_main_menu_keyboard() -> list[list[dict[str, Any]]]:
     ]
 
 
-def build_reminder_list_keyboard(reminders: list[Reminder]) -> list[list[dict[str, Any]]]:
+def build_reminder_list_keyboard(
+    reminders: list[Reminder],
+    next_times_map: dict[str, list[datetime]] | None = None,
+) -> list[list[dict[str, Any]]]:
     """
     构建提醒列表键盘（只显示有效的提醒）。
 
     Args:
         reminders: 提醒列表
+        next_times_map: {reminder_id: [next_fire_time, ...]}
 
     Returns:
         InlineKeyboard 按钮列表
     """
     keyboard: list[list[dict[str, Any]]] = []
-    
+    next_times_map = next_times_map or {}
+
     # 过滤出有效的提醒
     active_reminders = [r for r in reminders if r.is_active()]
 
     for reminder in active_reminders[:8]:  # 最多显示 8 个
-        schedule = reminder.get_human_readable_schedule()
-        text = f"{reminder.content[:20]} ({schedule})"
+        times = next_times_map.get(reminder.id, [])
+        time_str = _fmt_times(times)
+        if time_str:
+            text = f"{reminder.content[:16]} ({time_str})"
+        else:
+            text = reminder.content[:20]
         keyboard.append([
             {"text": text, "callback_data": f"reminder_detail_{reminder.id}"},
             {"text": "🗑️", "callback_data": f"reminder_delete_{reminder.id}"},
@@ -120,12 +140,16 @@ def build_delete_confirm_keyboard(reminder_id: str) -> list[list[dict[str, Any]]
     ]
 
 
-def format_reminder_detail(reminder: Reminder) -> str:
+def format_reminder_detail(
+    reminder: Reminder,
+    next_times: list[datetime] | None = None,
+) -> str:
     """
     格式化提醒详情文本。
 
     Args:
         reminder: 提醒对象
+        next_times: 接下来 N 次的触发时间
 
     Returns:
         格式化的文本
@@ -142,7 +166,13 @@ def format_reminder_detail(reminder: Reminder) -> str:
         f"创建：{created}",
     ]
 
-    if reminder.next_fire_time:
+    if next_times:
+        time_str = _fmt_times(next_times)
+        if len(next_times) == 1:
+            lines.append(f"下次提醒：{time_str}")
+        else:
+            lines.append(f"最近三次提醒：{time_str}")
+    elif reminder.next_fire_time:
         next_time = reminder.next_fire_time.strftime("%Y-%m-%d %H:%M")
         lines.append(f"下次提醒：{next_time}")
 
@@ -153,28 +183,34 @@ def format_reminder_detail(reminder: Reminder) -> str:
     return "\n".join(lines)
 
 
-def format_reminder_list(reminders: list[Reminder]) -> str:
+def format_reminder_list(
+    reminders: list[Reminder],
+    next_times_map: dict[str, list[datetime]] | None = None,
+) -> str:
     """
     格式化提醒列表文本（只显示有效的提醒）。
 
     Args:
         reminders: 提醒列表
+        next_times_map: {reminder_id: [next_fire_time, ...]}
 
     Returns:
         格式化的文本
     """
-    # 过滤出有效的提醒
+    next_times_map = next_times_map or {}
     active_reminders = [r for r in reminders if r.is_active()]
-    
+
     if not active_reminders:
         return "📋 暂无待提醒\n\n点击「创建提醒」添加新提醒。"
 
     lines = ["📋 **待提醒列表**\n"]
 
     for i, reminder in enumerate(active_reminders[:8], 1):
-        schedule = reminder.get_human_readable_schedule()
         lines.append(f"{i}. {reminder.content}")
-        lines.append(f"   {schedule}")
+        times = next_times_map.get(reminder.id, [])
+        time_str = _fmt_times(times)
+        if time_str:
+            lines.append(f"   {time_str}")
 
     if len(active_reminders) > 8:
         lines.append(f"\n... 还有 {len(active_reminders) - 8} 个提醒")
