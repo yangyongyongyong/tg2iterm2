@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -486,7 +486,8 @@ class ReminderManager:
             return []
         times: list[datetime] = []
         prev: datetime | None = None
-        now = datetime.now()
+        # 用 aware datetime，和 APScheduler trigger 内部保持一致
+        now = datetime.now().astimezone()
         for _ in range(count):
             try:
                 next_time = trigger.get_next_fire_time(prev, now)
@@ -494,11 +495,12 @@ class ReminderManager:
                 break
             if next_time is None:
                 break
-            # 统一去掉时区信息，方便后续展示
-            if next_time.tzinfo is not None:
-                next_time = next_time.astimezone().replace(tzinfo=None)
-            times.append(next_time)
+            # 去掉时区用于展示，但保留 aware 版本给下一轮用
+            display_time = next_time.astimezone().replace(tzinfo=None) if next_time.tzinfo else next_time
+            times.append(display_time)
             prev = next_time
+            # now 必须推进到 prev 之后，否则下一次返回相同时间
+            now = next_time + timedelta(seconds=1)
         return times
 
     def get_completed_reminders(self, chat_id: int | None = None) -> list[Reminder]:
