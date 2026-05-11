@@ -1,0 +1,15 @@
+# tg2iterm2 模块配置
+# 每个模块可以单独配置 Cursor CLI 的模型和参数
+
+# 提醒模块
+reminder:
+  # 模型选择：轻量任务用 fast 模型，延迟更低
+  # 可选值通过 `cursor agent --list-models` 查看
+  model: "auto"
+  # 超时时间（秒）
+  timeout: 120
+
+# 默认配置（未单独配置的模块使用此值）
+default:
+  model: "auto"
+  timeout: 180

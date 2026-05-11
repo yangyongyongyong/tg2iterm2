@@ -1,0 +1,14 @@
+[project]
+name = "tg2iterm2"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "iterm2>=2.0.0",
+    "apscheduler>=3.10.0",
+    "sqlalchemy>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+tg2iterm2 = "tg2iterm2:main"

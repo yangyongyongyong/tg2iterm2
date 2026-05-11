@@ -552,9 +552,11 @@ class Tg2ITermApp:
 
     # ─── 提醒模式方法 ───
 
-    def _on_reminder_triggered(self, reminder: Reminder) -> None:
-        """提醒触发时的回调（同步包装）。"""
-        asyncio.create_task(self._reminder_handlers.on_reminder_triggered(reminder))
+    async def _on_reminder_triggered(self, reminder: Reminder) -> None:
+        """提醒触发时的回调。"""
+        print(f"[BOT回调] 触发提醒: {reminder.id} - {reminder.content} -> chat_id={reminder.chat_id}")
+        await self._reminder_handlers.on_reminder_triggered(reminder)
+        print(f"[BOT回调] 消息已发送")
 
     async def _enter_reminder_mode(self, chat_id: int) -> None:
         """进入提醒模式。"""
