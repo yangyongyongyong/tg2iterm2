@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,7 @@ class AppConfig:
     perm_request_path: str
     perm_response_path: str
     perm_poll_interval: float
+    reminder_db_path: str
 
 
 def _read_required_env(name: str) -> str:
@@ -87,4 +89,7 @@ def load_config() -> AppConfig:
             "TG_PERM_RESPONSE_PATH", "/tmp/tg2iterm2_perm_response.json"
         ).strip() or "/tmp/tg2iterm2_perm_response.json",
         perm_poll_interval=_read_float_env("TG_PERM_POLL_INTERVAL", 0.5),
+        reminder_db_path=os.environ.get(
+            "TG_REMINDER_DB_PATH", ""
+        ).strip() or str(Path.home() / ".tg2iterm2" / "reminders.db"),
     )

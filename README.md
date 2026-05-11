@@ -94,6 +94,7 @@ flowchart TB
 - **文件接收**：用户通过 Telegram 发送文件到本机 `~/Downloads` 目录
 - **HTTP API**：本地 HTTP 接口，服务端可通过 curl 发送文本到 Telegram
 - **CLI 输出图片自动发送**：CLI 回复中包含本机图片路径时，自动将图片发送到 Telegram
+- **定时提醒**：通过 Bot 菜单进入提醒模式，支持自然语言创建提醒（如"每周三晚上8点提醒我自驾游"），支持单点、周期、复杂定时（每月第N个星期X），提醒数据持久化存储
 
 ## 环境要求
 
@@ -145,6 +146,7 @@ export TG_ALLOWED_CHAT_ID="your-chat-id"
 | `TG_PERM_RESPONSE_PATH` | 否 | 权限响应文件路径 |
 | `TG_PERM_POLL_INTERVAL` | 否 | 权限文件轮询间隔，默认 `0.5` 秒 |
 | `TG_HTTP_API_PORT` | 否 | HTTP API 监听端口，默认 `7288` |
+| `TG_REMINDER_DB_PATH` | 否 | 提醒数据库路径，默认 `~/.tg2iterm2/reminders.db` |
 
 ### 4. 安装 Hooks（Claude / Cursor 权限审批）
 
@@ -258,6 +260,26 @@ python tg2iterm2.py
 
 自动识别：图片用 `sendPhoto`（可预览），其他文件用 `sendDocument`，文件夹自动打包 `tar.gz`，超过 49MB 自动分片发送。
 
+### 定时提醒
+
+通过 `/reminder` 命令或 Bot 菜单进入提醒模式，支持自然语言创建提醒：
+
+```
+用户: 每周三晚上8点提醒我自驾游
+Bot: 已创建提醒
+     内容：自驾游
+     时间：每周三 20:00
+```
+
+**支持的定时格式**：
+- 单点定时：`2026-05-15 10:00 提醒我开会`
+- 周期定时：`每天22点提醒我跑步`、`每周三20点提醒我...`
+- 复杂定时：`每月第二个星期日提醒我...`（支持排除特定月份）
+
+**提醒管理**：
+- 查看列表、暂停、恢复、编辑、删除
+- 数据持久化存储，重启后自动恢复
+
 ### HTTP API（curl 接口）
 
 Bot 启动后监听本地 `127.0.0.1:7288`，服务端脚本可通过 curl 发送文本到 Telegram：
@@ -294,6 +316,14 @@ adapters/
   claude_adapter.py     # Claude CLI TUI 解析（回合完成检测、输出清理）
   cursor_adapter.py     # Cursor CLI TUI 解析（回合完成检测、输出清理）
   shell_adapter.py      # 普通 Shell 命令执行封装
+reminder/
+  __init__.py           # 模块入口
+  models.py             # Reminder 数据模型
+  manager.py            # ReminderManager（封装 APScheduler）
+  parser.py             # 自然语言解析器
+  triggers.py           # 自定义 Trigger（NthWeekdayTrigger）
+  ui.py                 # InlineKeyboard UI 生成
+  handlers.py           # 提醒模式处理方法
 hooks/
   permission_bridge.py  # 通用权限弹窗桥接（文件 IPC）
   claude_hook.py        # Claude PermissionRequest hook 脚本

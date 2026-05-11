@@ -18,6 +18,11 @@ from adapters.cursor_adapter import CursorAdapter
 from config import AppConfig
 from iterm_controller import ITermController
 from telegram_client import TelegramBotClient, limit_telegram_text, sanitize_filename
+from reminder.manager import ReminderManager
+from reminder.models import Reminder
+from reminder.parser import ReminderParser
+from reminder.handlers import ReminderHandlers
+from reminder import ui as reminder_ui
 
 CURSOR_ACTIVE_MARKER = Path("/tmp/tg2iterm2_cursor_active")
 CLAUDE_ACTIVE_MARKER = Path("/tmp/tg2iterm2_claude_active")
@@ -31,6 +36,9 @@ class SessionMode(Enum):
     SHELL = "shell"
     CLAUDE = "claude"
     CURSOR = "cursor"
+    REMINDER = "reminder"  # 提醒模式
+    REMINDER_CREATE = "reminder_create"  # 创建提醒子模式
+    REMINDER_EDIT = "reminder_edit"  # 编辑提醒子模式
 
 
 HELP_TEXT = """tg2iterm2 已连接。
@@ -74,6 +82,7 @@ ITERM_CONTROL_COMMANDS = [
     {"command": "fetch_file_or_dir", "description": "发送文件/图片（目录浏览）"},
     {"command": "send_2_server", "description": "发送文件到服务端"},
     {"command": "stop_receive", "description": "停止接收文件"},
+    {"command": "reminder", "description": "进入提醒模式"},
 ]
 
 
@@ -115,6 +124,12 @@ class Tg2ITermApp:
             hook_timeout=config.claude_hook_timeout,
         )
         self._cursor_adapter = CursorAdapter()
+        # 提醒管理
+        self._reminder_manager: ReminderManager | None = None
+        self._reminder_parser: ReminderParser | None = None
+        self._reminder_handlers: ReminderHandlers | None = None
+        self._reminder_editing_id: str | None = None  # 当前正在编辑的提醒 ID
+        self._pending_reminder_creation: bool = False  # 是否有待处理的提醒创建
 
     @property
     def _active_adapter(self) -> InteractiveAdapter | None:
@@ -129,6 +144,18 @@ class Tg2ITermApp:
         """启动 Telegram 长轮询主循环和本地 HTTP API。"""
         CURSOR_ACTIVE_MARKER.unlink(missing_ok=True)
         CLAUDE_ACTIVE_MARKER.unlink(missing_ok=True)
+        # 初始化提醒管理器
+        self._reminder_manager = ReminderManager(
+            db_path=Path(self._config.reminder_db_path),
+            on_reminder=self._on_reminder_triggered,
+        )
+        self._reminder_parser = ReminderParser()
+        self._reminder_handlers = ReminderHandlers(
+            self._telegram,
+            self._reminder_manager,
+            self._reminder_parser,
+        )
+        await self._reminder_manager.start()
         async with self._telegram:
             await self._telegram.delete_webhook(drop_pending_updates=True)
             await self._update_bot_menu()
@@ -137,6 +164,7 @@ class Tg2ITermApp:
             api_task = asyncio.create_task(self._start_http_api())
             await self._poll_forever()
             api_task.cancel()
+            await self._reminder_manager.stop()
 
     async def _start_http_api(self) -> None:
         """启动本地 HTTP API，支持 curl 发送消息到 Telegram。"""
@@ -188,6 +216,11 @@ class Tg2ITermApp:
         控制命令在上方，CLI 的 skill 按名称排序放在底部。
         """
         commands = list(ITERM_CONTROL_COMMANDS)
+        
+        # 根据当前模式添加特定命令
+        if self._session_mode == SessionMode.REMINDER:
+            commands.append({"command": "exit_reminder", "description": "退出提醒模式"})
+        
         adapter = self._active_adapter
         if adapter is not None:
             slash_cmds = adapter.get_slash_commands()
@@ -355,8 +388,29 @@ class Tg2ITermApp:
             prompt = stripped[8:].strip() if len(stripped) > 8 else ""
             await self._enter_cli_mode(chat_id, SessionMode.CURSOR, prompt)
             return
+        if stripped == "/reminder":
+            await self._enter_reminder_mode(chat_id)
+            return
+        if stripped == "/exit_reminder":
+            await self._exit_reminder_mode(chat_id)
+            return
+
+        # ─── 提醒模式处理 ───
+        if self._session_mode == SessionMode.REMINDER_CREATE:
+            await self._handle_reminder_create_input(chat_id, stripped)
+            return
+        if self._session_mode == SessionMode.REMINDER_EDIT:
+            await self._handle_reminder_edit_input(chat_id, stripped)
+            return
+        if self._session_mode == SessionMode.REMINDER:
+            # 提醒模式下，文本命令处理
+            await self._handle_reminder_mode_input(chat_id, stripped)
+            return
         if stripped == "/exit":
-            await self._exit_cli_mode(chat_id)
+            if self._session_mode in (SessionMode.REMINDER, SessionMode.REMINDER_CREATE, SessionMode.REMINDER_EDIT):
+                await self._exit_reminder_mode(chat_id)
+            else:
+                await self._exit_cli_mode(chat_id)
             return
         if stripped == "/new":
             await self._reset_cli_session(chat_id)
@@ -495,6 +549,199 @@ class Tg2ITermApp:
             return
 
         await self._telegram.send_message(chat_id, f"已重置 {mode_label} 会话（新会话将在首次交互后绑定）")
+
+    # ─── 提醒模式方法 ───
+
+    def _on_reminder_triggered(self, reminder: Reminder) -> None:
+        """提醒触发时的回调（同步包装）。"""
+        asyncio.create_task(self._reminder_handlers.on_reminder_triggered(reminder))
+
+    async def _enter_reminder_mode(self, chat_id: int) -> None:
+        """进入提醒模式。"""
+        if self._session_mode in (SessionMode.REMINDER, SessionMode.REMINDER_CREATE, SessionMode.REMINDER_EDIT):
+            await self._reminder_handlers.send_reminder_menu(chat_id)
+            return
+
+        if self._session_mode != SessionMode.SHELL:
+            await self._exit_cli_mode(chat_id, silent=True)
+
+        self._session_mode = SessionMode.REMINDER
+        await self._telegram.send_message(chat_id, "已进入提醒模式")
+        await self._reminder_handlers.send_reminder_menu(chat_id)
+
+    async def _exit_reminder_mode(self, chat_id: int) -> None:
+        """退出提醒模式。"""
+        self._session_mode = SessionMode.SHELL
+        self._reminder_editing_id = None
+        await self._telegram.send_message(chat_id, "已退出提醒模式")
+
+    async def _handle_reminder_mode_input(self, chat_id: int, text: str) -> None:
+        """处理提醒模式下的文本输入。"""
+        if text == "/exit":
+            await self._exit_reminder_mode(chat_id)
+            return
+        # 其他文本在提醒模式下忽略
+        await self._telegram.send_message(chat_id, "请使用菜单按钮操作，或发送 /exit 退出")
+
+    async def _handle_reminder_create_input(self, chat_id: int, text: str) -> None:
+        """处理创建提醒时的文本输入 - 直接调用 Cursor CLI 解析。"""
+        if text == "/exit":
+            self._session_mode = SessionMode.REMINDER
+            await self._reminder_handlers.send_reminder_menu(chat_id)
+            return
+
+        await self._telegram.send_message(
+            chat_id,
+            "正在通过 Cursor CLI 解析您的提醒请求...",
+        )
+
+        # 直接调用 Cursor CLI（后台静默执行）
+        result = await self._reminder_parser.parse_and_create(text, chat_id)
+
+        if result.get("success"):
+            output = result.get("output", "")
+            # 检查是否成功创建了提醒
+            if "成功" in output or "已创建" in output or "reminder_id" in output.lower() or "reminder" in output.lower():
+                # 重新从数据库加载提醒（同步外部创建的提醒）
+                await self._reminder_manager.reload_reminders()
+                await self._telegram.send_message(
+                    chat_id,
+                    f"✅ 提醒创建成功\n\n{output}",
+                )
+                # 显示提醒列表
+                await self._reminder_handlers.send_reminder_list(chat_id)
+            else:
+                await self._telegram.send_message(
+                    chat_id,
+                    f"解析结果：\n{output}",
+                )
+        else:
+            error = result.get("error", "未知错误")
+            await self._telegram.send_message(
+                chat_id,
+                f"❌ 解析失败：{error}",
+            )
+            # 提示用户重新输入或退出
+            await self._telegram.send_message(
+                chat_id,
+                "请重新描述您的提醒，或发送 /exit 退出",
+            )
+
+    async def _handle_reminder_edit_input(self, chat_id: int, text: str) -> None:
+        """处理编辑提醒时的文本输入。"""
+        if text == "/exit":
+            self._session_mode = SessionMode.REMINDER
+            self._reminder_editing_id = None
+            await self._reminder_handlers.send_reminder_menu(chat_id)
+            return
+
+        if not self._reminder_editing_id:
+            await self._telegram.send_message(chat_id, "编辑会话已失效")
+            self._session_mode = SessionMode.REMINDER
+            return
+
+        # 根据编辑类型处理（内容或时间）
+        reminder = self._reminder_manager.get_reminder(self._reminder_editing_id)
+        if not reminder:
+            await self._telegram.send_message(chat_id, "提醒不存在")
+            self._session_mode = SessionMode.REMINDER
+            return
+
+        success = await self._reminder_handlers.handle_edit_content(chat_id, self._reminder_editing_id, text)
+        if success:
+            self._session_mode = SessionMode.REMINDER
+            self._reminder_editing_id = None
+            await self._reminder_handlers.send_reminder_detail(chat_id, self._reminder_editing_id)
+
+    async def _handle_reminder_callback(
+        self, callback_id: str, data: str, chat_id: int, message_id: int
+    ) -> None:
+        """处理提醒相关的回调。"""
+        parts = data.split("_")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "menu":
+            await self._reminder_handlers.send_reminder_menu(chat_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "create":
+            self._session_mode = SessionMode.REMINDER_CREATE
+            await self._reminder_handlers.send_create_prompt(chat_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "list":
+            await self._reminder_handlers.send_reminder_list(chat_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "exit":
+            await self._exit_reminder_mode(chat_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "detail" and len(parts) > 2:
+            reminder_id = parts[2]
+            await self._reminder_handlers.send_reminder_detail(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "pause" and len(parts) > 2:
+            reminder_id = parts[2]
+            await self._reminder_handlers.handle_pause(chat_id, reminder_id)
+            await self._reminder_handlers.send_reminder_detail(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id, "已暂停")
+            return
+
+        if action == "resume" and len(parts) > 2:
+            reminder_id = parts[2]
+            await self._reminder_handlers.handle_resume(chat_id, reminder_id)
+            await self._reminder_handlers.send_reminder_detail(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id, "已恢复")
+            return
+
+        if action == "delete" and len(parts) > 2:
+            reminder_id = parts[2]
+            await self._reminder_handlers.send_delete_confirm(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        if action == "delete" and parts[2] == "confirm" and len(parts) > 3:
+            reminder_id = parts[3]
+            await self._reminder_handlers.handle_delete(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id, "已删除")
+            return
+
+        if action == "edit" and len(parts) > 2:
+            reminder_id = parts[2]
+            edit_type = parts[3] if len(parts) > 3 else ""
+
+            if edit_type == "content":
+                self._session_mode = SessionMode.REMINDER_EDIT
+                self._reminder_editing_id = reminder_id
+                await self._telegram.send_message(chat_id, "请输入新的提醒内容：")
+                await self._telegram.answer_callback_query(callback_id)
+                return
+
+            if edit_type == "time":
+                self._session_mode = SessionMode.REMINDER_EDIT
+                self._reminder_editing_id = reminder_id
+                await self._telegram.send_message(
+                    chat_id,
+                    "请输入新的时间，例如：\n"
+                    "- 每周三 20:00\n"
+                    "- 每天 22:00\n"
+                    "- 2026-05-15 10:00",
+                )
+                await self._telegram.answer_callback_query(callback_id)
+                return
+
+            await self._reminder_handlers.send_edit_menu(chat_id, reminder_id)
+            await self._telegram.answer_callback_query(callback_id)
+            return
+
+        await self._telegram.answer_callback_query(callback_id)
 
     async def _send_final_output(self, chat_id: int, message_id: int, text: str) -> None:
         """发送最终完成输出：短文本直接编辑，长文本分片追加新消息；自动发送引用的图片。"""
@@ -807,6 +1054,11 @@ class Tg2ITermApp:
 
         if chat_id != self._config.allowed_chat_id:
             await self._telegram.answer_callback_query(callback_id, "无权限")
+            return
+
+        # 提醒相关回调
+        if data.startswith("reminder_"):
+            await self._handle_reminder_callback(callback_id, data, chat_id, message_id)
             return
 
         if data.startswith("perm_cursor:"):
@@ -1750,3 +2002,8 @@ def _sync_session_id_from_marker(mode: SessionMode) -> None:
             _save_session_id(mode, bound_id)
     except (OSError, json.JSONDecodeError, ValueError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# 提醒模式相关方法（在 Tg2ITermApp 类中）
+# ---------------------------------------------------------------------------
