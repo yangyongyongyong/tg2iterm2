@@ -35,23 +35,34 @@ class ReminderHandlers:
             reply_markup,
         )
 
-    async def send_reminder_list(self, chat_id: int) -> None:
-        """发送提醒列表。"""
+    async def send_reminder_list(self, chat_id: int, page: int = 0) -> None:
+        """发送提醒列表。按下次触发时间正序排序（最近的在前）。"""
+        from datetime import datetime
+
         reminders = self._reminder_manager.get_all_reminders(chat_id)
+        # 按下次触发时间排序
+        sorted_reminders: list[Reminder] = []
+        for r in reminders:
+            times = self._reminder_manager.get_next_fire_times(r.id, count=1)
+            next_time = times[0] if times else datetime.max
+            sorted_reminders.append((next_time, r))
+        sorted_reminders.sort(key=lambda x: x[0])
+        reminders = [r for _, r in sorted_reminders]
+
         next_times_map = {
             r.id: self._reminder_manager.get_next_fire_times(r.id, count=3)
             for r in reminders
         }
-        text = reminder_ui.format_reminder_list(reminders, next_times_map)
-        keyboard = reminder_ui.build_reminder_list_keyboard(reminders, next_times_map)
+        text = reminder_ui.format_reminder_list(reminders, next_times_map, page=page)
+        keyboard = reminder_ui.build_reminder_list_keyboard(reminders, next_times_map, page=page)
         reply_markup = {"inline_keyboard": keyboard}
         await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
 
-    async def send_completed_list(self, chat_id: int) -> None:
+    async def send_completed_list(self, chat_id: int, page: int = 0) -> None:
         """发送已完成提醒列表。"""
         reminders = self._reminder_manager.get_completed_reminders(chat_id)
-        text = reminder_ui.format_completed_reminders(reminders)
-        keyboard = reminder_ui.build_completed_list_keyboard(reminders)
+        text = reminder_ui.format_completed_reminders(reminders, page=page)
+        keyboard = reminder_ui.build_completed_list_keyboard(reminders, page=page)
         reply_markup = {"inline_keyboard": keyboard}
         await self._telegram.send_message_with_reply_markup(chat_id, text, reply_markup)
 

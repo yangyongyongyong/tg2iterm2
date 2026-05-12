@@ -33,16 +33,33 @@ def build_main_menu_keyboard() -> list[list[dict[str, Any]]]:
     ]
 
 
+PAGE_SIZE = 5  # 每页显示的提醒数量
+
+
+def _build_pagination_row(base_cb: str, page: int, total: int) -> list[dict[str, Any]]:
+    """构建翻页导航行。"""
+    row: list[dict[str, Any]] = []
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if page > 0:
+        row.append({"text": "⬅️", "callback_data": f"{base_cb}_p{page - 1}"})
+    row.append({"text": f"{page + 1}/{total_pages}", "callback_data": "noop"})
+    if page < total_pages - 1:
+        row.append({"text": "➡️", "callback_data": f"{base_cb}_p{page + 1}"})
+    return row
+
+
 def build_reminder_list_keyboard(
     reminders: list[Reminder],
     next_times_map: dict[str, list[datetime]] | None = None,
+    page: int = 0,
 ) -> list[list[dict[str, Any]]]:
     """
     构建提醒列表键盘（只显示有效的提醒）。
 
     Args:
-        reminders: 提醒列表
+        reminders: 提醒列表（已排序）
         next_times_map: {reminder_id: [next_fire_time, ...]}
+        page: 当前页码
 
     Returns:
         InlineKeyboard 按钮列表
@@ -50,10 +67,10 @@ def build_reminder_list_keyboard(
     keyboard: list[list[dict[str, Any]]] = []
     next_times_map = next_times_map or {}
 
-    # 过滤出有效的提醒
-    active_reminders = [r for r in reminders if r.is_active()]
+    start = page * PAGE_SIZE
+    page_items = reminders[start:start + PAGE_SIZE]
 
-    for reminder in active_reminders[:8]:  # 最多显示 8 个
+    for reminder in page_items:
         times = next_times_map.get(reminder.id, [])
         time_str = _fmt_times(times)
         if time_str:
@@ -64,6 +81,10 @@ def build_reminder_list_keyboard(
             {"text": text, "callback_data": f"reminder_detail_{reminder.id}"},
             {"text": "🗑️", "callback_data": f"reminder_delete_{reminder.id}"},
         ])
+
+    # 翻页按钮
+    if len(reminders) > PAGE_SIZE:
+        keyboard.append(_build_pagination_row("reminder_list", page, len(reminders)))
 
     keyboard.append([{"text": "返回", "callback_data": "reminder_menu"}])
 
@@ -186,56 +207,65 @@ def format_reminder_detail(
 def format_reminder_list(
     reminders: list[Reminder],
     next_times_map: dict[str, list[datetime]] | None = None,
+    page: int = 0,
 ) -> str:
     """
-    格式化提醒列表文本（只显示有效的提醒）。
+    格式化提醒列表文本。
 
     Args:
-        reminders: 提醒列表
+        reminders: 提醒列表（已排序，已过滤）
         next_times_map: {reminder_id: [next_fire_time, ...]}
+        page: 当前页码
 
     Returns:
         格式化的文本
     """
     next_times_map = next_times_map or {}
-    active_reminders = [r for r in reminders if r.is_active()]
 
-    if not active_reminders:
+    if not reminders:
         return "📋 暂无待提醒\n\n点击「创建提醒」添加新提醒。"
 
-    lines = ["📋 **待提醒列表**\n"]
+    total_pages = max(1, (len(reminders) + PAGE_SIZE - 1) // PAGE_SIZE)
+    lines = [f"📋 **待提醒列表**  ({page + 1}/{total_pages})\n"]
 
-    for i, reminder in enumerate(active_reminders[:8], 1):
+    start = page * PAGE_SIZE
+    for i, reminder in enumerate(reminders[start:start + PAGE_SIZE], start + 1):
         lines.append(f"{i}. {reminder.content}")
         times = next_times_map.get(reminder.id, [])
         time_str = _fmt_times(times)
         if time_str:
             lines.append(f"   {time_str}")
 
-    if len(active_reminders) > 8:
-        lines.append(f"\n... 还有 {len(active_reminders) - 8} 个提醒")
-
     return "\n".join(lines)
 
 
-def build_completed_list_keyboard(reminders: list[Reminder]) -> list[list[dict[str, Any]]]:
+def build_completed_list_keyboard(
+    reminders: list[Reminder],
+    page: int = 0,
+) -> list[list[dict[str, Any]]]:
     """
     构建已完成提醒列表键盘。
 
     Args:
-        reminders: 已完成提醒列表
+        reminders: 已完成提醒列表（已排序）
+        page: 当前页码
 
     Returns:
         InlineKeyboard 按钮列表
     """
     keyboard: list[list[dict[str, Any]]] = []
 
-    for reminder in reminders[:8]:
+    start = page * PAGE_SIZE
+    for reminder in reminders[start:start + PAGE_SIZE]:
         status = "✅" if reminder.triggered else "⏰"
         text = f"{status} {reminder.content[:20]}"
         keyboard.append([
             {"text": text, "callback_data": f"reminder_detail_{reminder.id}"}
         ])
+
+    # 翻页按钮
+    if len(reminders) > PAGE_SIZE:
+        keyboard.append(_build_pagination_row("reminder_completed", page, len(reminders)))
 
     keyboard.append([{"text": "返回", "callback_data": "reminder_menu"}])
 
@@ -258,12 +288,16 @@ def build_completed_detail_keyboard(reminder: Reminder) -> list[list[dict[str, A
     ]
 
 
-def format_completed_reminders(reminders: list[Reminder]) -> str:
+def format_completed_reminders(
+    reminders: list[Reminder],
+    page: int = 0,
+) -> str:
     """
     格式化已完成提醒列表文本。
 
     Args:
-        reminders: 已完成提醒列表
+        reminders: 已完成提醒列表（已排序）
+        page: 当前页码
 
     Returns:
         格式化的文本
@@ -271,9 +305,11 @@ def format_completed_reminders(reminders: list[Reminder]) -> str:
     if not reminders:
         return "📜 暂无历史记录\n\n所有已触发或过期的提醒会显示在这里。"
 
-    lines = ["📜 **历史记录**\n"]
+    total_pages = max(1, (len(reminders) + PAGE_SIZE - 1) // PAGE_SIZE)
+    lines = [f"📜 **历史记录**  ({page + 1}/{total_pages})\n"]
 
-    for i, reminder in enumerate(reminders[:8], 1):
+    start = page * PAGE_SIZE
+    for i, reminder in enumerate(reminders[start:start + PAGE_SIZE], start + 1):
         status = "✅ 已提醒" if reminder.triggered else "⏰ 已过期"
         if reminder.triggered_at:
             time_str = reminder.triggered_at.strftime("%m-%d %H:%M")
@@ -281,8 +317,5 @@ def format_completed_reminders(reminders: list[Reminder]) -> str:
             time_str = reminder.created_at.strftime("%m-%d %H:%M")
         lines.append(f"{i}. {reminder.content}")
         lines.append(f"   {status} · {time_str}")
-
-    if len(reminders) > 8:
-        lines.append(f"\n... 还有 {len(reminders) - 8} 条记录")
 
     return "\n".join(lines)

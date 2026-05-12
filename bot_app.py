@@ -728,12 +728,18 @@ class Tg2ITermApp:
             return
 
         if action == "list":
-            await self._reminder_handlers.send_reminder_list(chat_id)
+            page = 0
+            if len(parts) > 2 and parts[2].startswith("p"):
+                page = int(parts[2][1:])
+            await self._reminder_handlers.send_reminder_list(chat_id, page=page)
             await self._telegram.answer_callback_query(callback_id)
             return
 
         if action == "completed":
-            await self._reminder_handlers.send_completed_list(chat_id)
+            page = 0
+            if len(parts) > 2 and parts[2].startswith("p"):
+                page = int(parts[2][1:])
+            await self._reminder_handlers.send_completed_list(chat_id, page=page)
             await self._telegram.answer_callback_query(callback_id)
             return
 
