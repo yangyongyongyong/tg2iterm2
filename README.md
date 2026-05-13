@@ -86,9 +86,10 @@ flowchart TB
 - 发送图片到终端（保存为临时文件，路径自动前置到下一条文本命令）
 - 前台交互命令支持：运行中的命令可继续接收 stdin 输入
 - 发送控制键：Ctrl+C、Ctrl+D、Enter
-- **多模式切换**：Shell / Claude / Cursor 三种模式
+- **多模式切换**：Shell / Claude / Cursor / OpenCode 四种模式
 - **Claude Code 集成**：进入 Claude 模式后与 Claude CLI 交互，权限请求通过 TG 按钮远程审批
 - **Cursor CLI 集成**：进入 Cursor 模式后与 Cursor agent 交互，权限请求通过 TG 按钮远程审批
+- **OpenCode 集成**：支持 OpenCode 交互模式与静默模式，共享上下文目录持续复用
 - **动态 Bot 菜单**：根据当前模式动态显示可用的 skill/斜杠命令
 - **文件发送**：通过 Inline Keyboard 浏览本机目录或输入路径，将文件/图片发送到 Telegram；文件夹自动打包 tar.gz，大文件自动分片
 - **文件接收**：用户通过 Telegram 发送文件到本机 `~/Downloads` 目录
@@ -225,12 +226,43 @@ python tg2iterm2.py
 
 | 命令 | 说明 |
 |------|------|
-| `/claude` | 进入 Claude 模式（在 iTerm2 中启动 Claude CLI） |
+| `/claude` | 进入 Claude 模式（新建并绑定独立 iTerm2 tab 后启动 Claude CLI） |
 | `/claude <prompt>` | 进入 Claude 模式并发送首条消息 |
-| `/cursor` | 进入 Cursor 模式（在 iTerm2 中启动 Cursor agent） |
+| `/cursor` | 进入 Cursor 模式（新建并绑定独立 iTerm2 tab 后启动 Cursor agent） |
 | `/cursor <prompt>` | 进入 Cursor 模式并发送首条消息 |
+| `/opencode` | 进入 OpenCode 模式（新建并绑定独立 iTerm2 tab 后启动 OpenCode） |
+| `/opencode <prompt>` | 进入 OpenCode 模式并发送首条消息 |
+| `/opencode_project` | 列出可复用历史上下文的 OpenCode 项目并进入 |
+| `/opencode_project_add` | 手动添加 OpenCode 项目路径，并直接进入该项目 |
+| `/claude_silent` | 进入 Claude 静默模式 |
+| `/cursor_silent` | 进入 Cursor 静默模式 |
+| `/opencode_silent` | 进入 OpenCode 静默模式 |
 | `/exit` | 退出当前 CLI 模式，回到 Shell |
 | `/new` | 重置当前 CLI 会话 |
+
+交互 CLI 的当前行为：
+
+- 进入 `/claude`、`/cursor`、`/opencode` 时，bot 会先新建并绑定一个独立 iTerm2 tab，避免复用当前活跃 tab 导致和其他交互程序冲突。
+- 新建后会尽量把 iTerm2 焦点切回你原来正在看的 tab，因此 bot 自己的执行 tab 默认在后台工作，不打断当前可见界面。
+- 进入成功后，Telegram 提示消息会回显 `当前绑定 tab：N`。
+- 如果 Claude 已保存的 `session_id` 失效，bot 会自动清理旧 session 并切换到新会话，避免后续输入掉回 shell。
+
+OpenCode 项目进入：
+
+- `/opencode_project` 会优先读取 `OpenCode` 自己数据库中的项目根目录（`opencode.db -> project.worktree`），展示最近可用项目。
+- bot 同时会把你手动添加过的项目路径，以及 bot 侧的项目使用频率，保存在 `~/.tg2iterm2/opencode_projects.json`。
+- `/opencode_project` 消息会带 Inline Keyboard，可直接点选项目进入；也支持发送序号或目录绝对路径。
+- 发送序号或点选按钮后，bot 会等效执行 `opencode -c <项目目录>`，并进入该项目的 OpenCode 上下文。
+- `/opencode_project_add` 可手动补充数据库里还没有出现过的项目路径；添加后会直接进入该项目。
+- 手动添加时支持两种格式：
+  - `/绝对路径`
+  - `别名 | /绝对路径`
+- 如果项目保存了别名，按钮和列表会优先显示别名；未保存别名时默认显示目录名。
+- 项目列表支持分页，并按三组展示：`置顶项目`、`收藏项目`、`最近项目`。
+- 排序优先级为：`置顶 > 收藏 > 最近`；同组内再按 bot 侧使用频率排序。
+- 每个项目旁边都可以直接切换：
+  - `☆/⭐ 收藏`
+  - `📍/📌 置顶`
 
 ### iTerm2 控制（任何模式下可用）
 
@@ -250,7 +282,7 @@ python tg2iterm2.py
 
 | 命令 | 说明 |
 |------|------|
-| `/fetch_file_or_dir` | 从本机发送文件/图片到 Telegram（支持输入路径或目录浏览） |
+| `/fetch_file_or_dir` | 从服务端拉取文件(夹)到 Telegram（支持输入路径或目录浏览） |
 | `/send_2_server` | 进入文件接收模式，用户发送的文件/图片保存到 `~/Downloads` |
 | `/stop_receive` | 退出文件接收模式 |
 
@@ -298,9 +330,13 @@ curl -X POST http://127.0.0.1:7288/send \
 
 ### 使用方式
 
-**Shell 模式（默认）**：直接发送普通文本会在当前 tab 中执行（自动追加回车）。
+**Shell 模式（默认）**：直接发送普通文本时，bot 会默认新建并绑定一个独立 iTerm2 tab，在该 tab 中执行命令（自动追加回车），并尽量不切走你当前正在看的 tab。
 
-**Claude/Cursor 模式**：进入后所有文本直接发送到对应 CLI 作为对话输入，Bot 流式返回 CLI 的回复。
+**Claude/Cursor/OpenCode 模式**：进入后所有文本直接发送到对应 CLI 作为对话输入，Bot 流式返回 CLI 的回复。
+
+**交互 CLI tab 绑定**：进入 `Claude/Cursor/OpenCode` 时默认后台新建独立 tab，并将该 tab 绑定为 bot 的当前目标 tab；后续 `/new` 会在这个已绑定 tab 内重开会话。
+
+**Claude 恢复兜底**：如果 `claude --resume <session_id>` 对应的会话已不存在，bot 会自动清理失效 session，并在同一绑定 tab 内重启一个全新 Claude 会话。
 
 ## 项目结构
 

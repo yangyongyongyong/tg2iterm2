@@ -247,7 +247,7 @@ class TelegramBotClient:
 
     async def set_my_commands(self, extra_commands: list[dict[str, str]] | None = None) -> None:
         """注册 Telegram 机器人命令菜单。"""
-        commands = [
+        default_commands = [
             {"command": "start", "description": "显示帮助"},
             {"command": "help", "description": "显示帮助"},
             {"command": "tabs", "description": "列出 iTerm2 tab"},
@@ -259,12 +259,11 @@ class TelegramBotClient:
             {"command": "ctrl_d", "description": "发送 Ctrl+D"},
             {"command": "last", "description": "获取倒数 N 行"},
             {"command": "get_last_10_line", "description": "获取倒数 10 行"},
-            {"command": "fetch_file_or_dir", "description": "发送文件/图片（目录浏览）"},
+            {"command": "fetch_file_or_dir", "description": "从服务端拉取文件(夹)"},
             {"command": "send_2_server", "description": "发送文件到服务端"},
             {"command": "stop_receive", "description": "停止接收文件"},
         ]
-        if extra_commands:
-            commands.extend(extra_commands)
+        commands = list(extra_commands) if extra_commands is not None else default_commands
         await self._request("setMyCommands", {"commands": commands})
 
     async def download_file_by_id(

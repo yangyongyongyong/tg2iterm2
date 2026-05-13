@@ -16,12 +16,20 @@ import iterm2
 
 
 ENTER_KEY = "\r"
+SCREEN_TEXT_PROMPT_ID = "__screen_text__"
 CLAUDE_DONE_SIGNAL_DEFAULT = Path("/tmp/tg2iterm2_claude_done")
 CLAUDE_STATUS_RE = re.compile(r"^\s*✻\s+.+\s+for\s+\d+(?:\.\d+)?s\s*$")
 CLAUDE_TIP_RE = re.compile(r"^\s*(?:⎿\s*)?tip:\s+.+$", re.IGNORECASE)
 CLAUDE_SPINNER_RE = re.compile(r"^\s*[✽✻]\s+.+(?:\.{3}|…)\s*(?:\(.*\))?\s*$")
+PASTED_INPUT_PREFIX_RE = re.compile(r"^\[Pasted\b.*", re.IGNORECASE)
+CURSOR_FOLLOW_UP_RE = re.compile(r"^→\s+Add a follow-up\s*$", re.IGNORECASE)
+CURSOR_COMPOSER_STATUS_RE = re.compile(r"^Composer\b.*$", re.IGNORECASE)
+OPENCODE_TOKENS_RE = re.compile(r"^[0-9][0-9,\.]*\s+tokens$", re.IGNORECASE)
+OPENCODE_PERCENT_RE = re.compile(r"^[0-9][0-9,\.]*%\s+used$", re.IGNORECASE)
+OPENCODE_COST_RE = re.compile(r"^\$[0-9][0-9,\.]*\s+spent$", re.IGNORECASE)
+OPENCODE_COMMANDS_RE = re.compile(r"^.*ctrl\+p\s+commands.*OpenCode.*$", re.IGNORECASE)
 
-INTERACTIVE_CLI_NAMES = {"claude", "agent"}
+INTERACTIVE_CLI_NAMES = {"claude", "agent", "opencode"}
 
 
 @dataclass(frozen=True)
@@ -132,8 +140,8 @@ class ITermController:
         self._default_tab_unique_id = str(tab.tab_id)
         return number
 
-    async def create_new_tab(self) -> int:
-        """在当前窗口新建 tab，没有窗口时创建新窗口。"""
+    async def create_new_tab(self, activate: bool = True) -> int:
+        """在当前窗口新建 tab；可选择是否保持当前可见 tab 不变。"""
         app = await self._get_app()
         window = app.current_window
         if window is None:
@@ -143,13 +151,48 @@ class ITermController:
                 raise RuntimeError("创建 iTerm2 窗口失败")
             app = await self._get_app()
             window = app.current_window or window
+        previous_tab = window.current_tab
         tab = await window.async_create_tab()
         if tab is None:
             raise RuntimeError("创建 iTerm2 tab 失败")
-        await tab.async_activate()
         self._default_tab_unique_id = str(tab.tab_id)
         self._default_tab_number = await self._number_for_tab(tab)
+        if activate:
+            await tab.async_activate()
+        elif previous_tab is not None and previous_tab.tab_id != tab.tab_id:
+            await previous_tab.async_activate()
         return self._default_tab_number
+
+    def clear_default_tab(self) -> None:
+        """清除当前绑定的默认目标 tab。"""
+        self._default_tab_unique_id = None
+        self._default_tab_number = None
+
+    async def close_target_tab(self) -> None:
+        """关闭当前绑定的目标 tab，并清理前台状态与默认绑定。"""
+        tab: iterm2.Tab | None = None
+        if self._default_tab_unique_id:
+            tab = await self._find_tab_by_unique_id(self._default_tab_unique_id)
+        elif self._default_tab_number:
+            tab = await self._find_tab_by_number(self._default_tab_number)
+        self.clear_default_tab()
+        if tab is None:
+            self._foreground_session = None
+            self._foreground_prompt_id = None
+            self._foreground_command_name = None
+            self._foreground_last_output = ""
+            self._suppress_foreground_stream = False
+            return
+        session = tab.current_session
+        if session is not None:
+            self._clear_foreground_state(session)
+        else:
+            self._foreground_session = None
+            self._foreground_prompt_id = None
+            self._foreground_command_name = None
+            self._foreground_last_output = ""
+            self._suppress_foreground_stream = False
+        await tab.async_close(force=True)
 
     async def send_text(self, text: str, enter: bool = False) -> None:
         """向当前 session 输入文本，可选择是否追加回车。"""
@@ -199,6 +242,18 @@ class ITermController:
         text = await self.read_session_screen_text(session)
         lines = text.splitlines()
         return "\n".join(lines[-count:]) if lines else ""
+
+    async def wait_until_shell_ready(self, timeout: float = 30.0) -> None:
+        """等待当前目标 tab 中的 shell prompt 就绪。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last_text = ""
+        while loop.time() < deadline:
+            last_text = await self.read_last_lines(10)
+            if any(_is_shell_prompt_line(line) for line in last_text.splitlines()):
+                return
+            await asyncio.sleep(0.2)
+        raise RuntimeError(f"等待 shell prompt 超时，最后屏幕内容: {last_text!r}")
 
     async def read_session_screen_text(self, session: iterm2.Session) -> str:
         """读取指定 session 当前屏幕内容。"""
@@ -333,8 +388,15 @@ class ITermController:
             before_ns = time.time_ns()
 
             is_interactive_cli = self._foreground_command_name in INTERACTIVE_CLI_NAMES
-            if is_interactive_cli and self._foreground_command_name != "claude":
-                # Cursor 等非 Claude CLI 需要分步发送文本和回车
+            if self._foreground_command_name == "agent":
+                # Cursor Agent 的输入框对粘贴内容更敏感，双回车更稳定地触发提交。
+                await session.async_send_text(text, suppress_broadcast=True)
+                await asyncio.sleep(0.15)
+                await session.async_send_text(ENTER_KEY, suppress_broadcast=True)
+                await asyncio.sleep(0.15)
+                await session.async_send_text(ENTER_KEY, suppress_broadcast=True)
+            elif is_interactive_cli and self._foreground_command_name != "claude":
+                # OpenCode 等非 Claude CLI 需要分步发送文本和回车
                 await session.async_send_text(text, suppress_broadcast=True)
                 await asyncio.sleep(0.15)
                 await session.async_send_text(ENTER_KEY, suppress_broadcast=True)
@@ -426,6 +488,7 @@ class ITermController:
                 last_change_at = now
             if is_interactive_cli:
                 signal_ns = self._read_hook_signal_ns(cli_name)
+                cursor_has_answer = _has_cursor_answer(last_delta) if cli_name == "agent" else False
                 completed = (
                     signal_ns is not None
                     and signal_ns > before_ns
@@ -434,13 +497,24 @@ class ITermController:
                     if cli_name == "claude":
                         if has_claude_answer(last_delta) and has_claude_ready_prompt_tail(current_output):
                             completed = True
-                    else:
-                        if _has_interactive_prompt_tail(current_output) and _has_substantive_content(last_delta):
+                    elif cli_name == "opencode":
+                        if _has_opencode_answer(last_delta) and now - last_change_at >= idle_seconds:
                             completed = True
+                    else:
+                        if _has_cursor_ready_state(current_output) and cursor_has_answer:
+                            completed = True
+                if not completed and cli_name == "agent":
+                    if _has_cursor_ready_state(current_output) and cursor_has_answer:
+                        completed = True
+                if not completed and cli_name == "opencode":
+                    if _has_opencode_answer(last_delta) and now - last_change_at >= idle_seconds:
+                        completed = True
                 if not completed and now > hook_deadline:
                     completed = seen_input_anchor
                 if completed and cli_name == "claude":
                     rendered_delta = clean_claude_delta(last_delta)
+                elif completed and cli_name == "opencode":
+                    rendered_delta = _clean_opencode_delta(last_delta)
                 elif completed:
                     rendered_delta = _clean_generic_delta(last_delta)
                 else:
@@ -470,8 +544,14 @@ class ITermController:
                     final_delta = last_delta
                 if cli_name == "claude":
                     final_rendered_delta = clean_claude_delta(final_delta)
+                elif cli_name == "opencode":
+                    final_rendered_delta = _clean_opencode_delta(final_delta)
                 else:
                     final_rendered_delta = _clean_generic_delta(final_delta)
+                if cli_name == "agent" and not _has_cursor_answer(final_delta):
+                    continue
+                if cli_name == "opencode" and not _has_opencode_answer(final_delta):
+                    continue
                 await on_update(final_rendered_delta)
                 return final_rendered_delta
             if should_update:
@@ -531,6 +611,8 @@ class ITermController:
         prompt_id: str | None,
     ) -> str:
         """只按 shell integration 的 prompt 输出范围读取本次命令输出。"""
+        if prompt_id == SCREEN_TEXT_PROMPT_ID:
+            return await self.read_session_screen_text(session)
         if prompt_id:
             try:
                 output = await self._read_prompt_output(session, prompt_id)
@@ -738,6 +820,12 @@ def lines_to_text(lines: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _is_shell_prompt_line(line: str) -> bool:
+    """判断一行是否像 zsh/bash 的空 shell prompt。"""
+    stripped = line.replace("\x00", "").replace("\xa0", " ").strip()
+    return stripped.endswith("%") or stripped.endswith("$") or stripped.endswith("#")
+
+
 def parse_tab_number(value: str) -> int:
     """解析用户输入的 tab 编号。"""
     try:
@@ -766,6 +854,20 @@ def output_after(before_output: str, current_output: str, submitted_text: str) -
     if before_output and current_output.startswith(before_output):
         return current_output[len(before_output):].lstrip("\n")
     return ""
+
+
+def _input_anchor_candidates(submitted_text: str) -> list[str]:
+    """返回可用于匹配本轮输入回显的候选文本。"""
+    candidates: list[str] = []
+    primary = submitted_text.strip()
+    if primary:
+        candidates.append(primary)
+    non_empty_lines = [line.strip() for line in submitted_text.splitlines() if line.strip()]
+    if non_empty_lines:
+        tail = non_empty_lines[-1]
+        if tail not in candidates:
+            candidates.append(tail)
+    return candidates
 
 
 def looks_like_claude_delta(delta: str) -> bool:
@@ -912,10 +1014,7 @@ def is_separator_line(stripped_line: str) -> bool:
 
 def find_last_anchor(current_output: str, submitted_text: str) -> int:
     """定位本轮输入在当前输出中的最后一次出现位置。"""
-    candidates = [submitted_text.strip()]
-    non_empty_lines = [line.strip() for line in submitted_text.splitlines() if line.strip()]
-    if non_empty_lines:
-        candidates.append(non_empty_lines[-1])
+    candidates = _input_anchor_candidates(submitted_text)
     lines = current_output.splitlines(keepends=True)
     offset = 0
     best_anchor = -1
@@ -927,7 +1026,7 @@ def find_last_anchor(current_output: str, submitted_text: str) -> int:
             index = line_text.rfind(candidate)
             if index < 0:
                 continue
-            if is_input_anchor_line(line_text, index):
+            if is_input_anchor_line(line_text, index) or _is_pasted_input_anchor_line(line_text, index):
                 best_anchor = offset + index + len(candidate)
         offset += len(line)
     if best_anchor >= 0:
@@ -941,8 +1040,8 @@ def _find_loose_anchor(current_output: str, submitted_text: str) -> int:
     适用于 Cursor 等 TUI 不显示 prompt 前缀的场景。
     仅匹配整行内容等于 submitted_text 的行，避免从 agent 回复正文中截断。
     """
-    needle = submitted_text.strip()
-    if not needle:
+    candidates = _input_anchor_candidates(submitted_text)
+    if not candidates:
         return -1
     lines = current_output.splitlines(keepends=True)
     offset = 0
@@ -950,10 +1049,24 @@ def _find_loose_anchor(current_output: str, submitted_text: str) -> int:
     for line in lines:
         line_text = line.rstrip("\r\n")
         stripped = normalize_terminal_line(line_text)
-        if stripped == needle:
-            best = offset + len(line_text)
+        stripped_without_bar = stripped.lstrip("┃").strip()
+        for candidate in candidates:
+            if stripped == candidate or stripped_without_bar == candidate:
+                best = offset + len(line_text)
+                continue
+            index = line_text.rfind(candidate)
+            if index >= 0 and _is_pasted_input_anchor_line(line_text, index):
+                best = offset + index + len(candidate)
         offset += len(line)
     return best if best >= 0 else -1
+
+
+def _is_pasted_input_anchor_line(line: str, candidate_index: int) -> bool:
+    """判断命中的文本是否出现在 iTerm2 的粘贴回显行里。"""
+    if candidate_index <= 0:
+        return False
+    prefix = normalize_terminal_line(line[:candidate_index])
+    return bool(prefix) and PASTED_INPUT_PREFIX_RE.match(prefix) is not None
 
 
 def is_input_anchor_line(line: str, candidate_index: int) -> bool:
@@ -966,8 +1079,8 @@ def is_input_anchor_line(line: str, candidate_index: int) -> bool:
     if not prefix:
         return False
     return (
-        prefix in {"❯", ">", ">>>", "..."}
-        or prefix.endswith(("❯", ">", "$", "%", "#"))
+        prefix in {"❯", ">", ">>>", "...", "┃"}
+        or prefix.endswith(("❯", ">", "$", "%", "#", "┃"))
     )
 
 
@@ -1000,23 +1113,113 @@ def _has_interactive_prompt_tail(text: str) -> bool:
     return False
 
 
+def _has_cursor_ready_state(text: str) -> bool:
+    """判断 Cursor 是否回到了可继续追问的完成态。"""
+    if _has_interactive_prompt_tail(text):
+        return True
+    for line in text.splitlines():
+        stripped = normalize_terminal_line(line)
+        if CURSOR_FOLLOW_UP_RE.match(stripped):
+            return True
+    return False
+
+
 def _has_substantive_content(delta: str) -> bool:
     """判断 delta 中是否包含非提示符、非噪声的实质内容。"""
     for line in delta.splitlines():
         stripped = normalize_terminal_line(line)
         if not stripped:
             continue
-        if stripped in {">", "❯"}:
-            continue
-        if _is_separator_generic(stripped):
+        if _is_generic_noise_line(stripped):
             continue
         return True
     return False
 
 
+def _has_cursor_answer(delta: str) -> bool:
+    """判断 Cursor 输出里是否已出现真正回答正文。"""
+    return bool(_clean_generic_delta(delta).strip())
+
+
+def _has_opencode_answer(delta: str) -> bool:
+    """判断 OpenCode 输出里是否已出现真正回答正文。"""
+    return bool(_clean_opencode_delta(delta).strip())
+
+
 def _is_separator_generic(stripped: str) -> bool:
     """判断一行是否为分隔线（通用）。"""
     return bool(stripped) and set(stripped) <= {"─", "-", "━", "═", "▄", "▀"}
+
+
+def _is_generic_noise_line(stripped: str) -> bool:
+    """判断一行是否属于交互 CLI 的噪声/UI 提示。"""
+    if not stripped:
+        return False
+    if stripped in {">", "❯", "~", "<system-reminder>", "</system-reminder>", "Auto-run"}:
+        return True
+    if _is_separator_generic(stripped):
+        return True
+    if PASTED_INPUT_PREFIX_RE.match(stripped):
+        return True
+    if CURSOR_FOLLOW_UP_RE.match(stripped):
+        return True
+    if CURSOR_COMPOSER_STATUS_RE.match(stripped):
+        return True
+    if stripped in {"Greeting", "Context", "LSP", "LSPs are disabled"}:
+        return True
+    if OPENCODE_TOKENS_RE.match(stripped):
+        return True
+    if OPENCODE_PERCENT_RE.match(stripped):
+        return True
+    if OPENCODE_COST_RE.match(stripped):
+        return True
+    if OPENCODE_COMMANDS_RE.match(stripped):
+        return True
+    if stripped.startswith("▣  Build"):
+        return True
+    if stripped.startswith("Build · "):
+        return True
+    if stripped.startswith("Your operational mode has changed from "):
+        return True
+    if stripped.startswith("You are no longer in "):
+        return True
+    if stripped.startswith("You are permitted to "):
+        return True
+    return False
+
+
+def _is_opencode_noise_line(stripped: str) -> bool:
+    """判断一行是否属于 OpenCode TUI 的输入栏、侧栏或状态栏。"""
+    if _is_generic_noise_line(stripped):
+        return True
+    if stripped.startswith("┃"):
+        return True
+    if "esc interrupt" in stripped.lower():
+        return True
+    if stripped.startswith("╹") and set(stripped[1:]) <= {"─", "-", "━", "═", "▄", "▀", " ", "▌", "▐", "█"}:
+        return True
+    return False
+
+
+def _clean_opencode_delta(delta: str) -> str:
+    """清理 OpenCode 的输入栏、思考侧栏和底部状态栏。"""
+    lines = [
+        line.replace("\x00", " ").replace("\xa0", " ")
+        for line in delta.splitlines()
+    ]
+    while lines:
+        stripped = normalize_terminal_line(lines[-1])
+        if not stripped:
+            lines.pop()
+            continue
+        if _is_opencode_noise_line(stripped):
+            lines.pop()
+            continue
+        break
+    lines = [line for line in lines if not _is_opencode_noise_line(normalize_terminal_line(line))]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def _clean_generic_delta(delta: str) -> str:
@@ -1030,13 +1233,11 @@ def _clean_generic_delta(delta: str) -> str:
         if not stripped:
             lines.pop()
             continue
-        if stripped in {">", "❯"}:
-            lines.pop()
-            continue
-        if _is_separator_generic(stripped):
+        if _is_generic_noise_line(stripped):
             lines.pop()
             continue
         break
+    lines = [line for line in lines if not _is_generic_noise_line(normalize_terminal_line(line))]
     while lines and not lines[0].strip():
         lines.pop(0)
     return "\n".join(lines).strip()

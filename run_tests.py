@@ -5,21 +5,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import inspect
 import os
 import shutil
 import sys
 import tempfile
+import bot_app as bot_module
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from bot_app import Tg2ITermApp, render_stream_message
+from adapters.opencode_adapter import OpenCodeAdapter
+from bot_app import SessionMode, Tg2ITermApp, _is_invalid_claude_resume_error, _sort_commands_by_usage, render_stream_message
 from config import AppConfig, load_config
 from iterm_controller import (
     ITermController,
+    _clean_generic_delta,
+    _clean_opencode_delta,
+    _has_cursor_answer,
+    _has_cursor_ready_state,
+    _has_opencode_answer,
     CLAUDE_DONE_SIGNAL_DEFAULT,
+    SCREEN_TEXT_PROMPT_ID,
     clean_claude_delta,
     command_name,
     is_claude_prompt_cursor,
@@ -27,7 +36,7 @@ from iterm_controller import (
     output_after,
     parse_tab_number,
 )
-from telegram_client import limit_telegram_text, sanitize_filename
+from telegram_client import TelegramBotClient, limit_telegram_text, sanitize_filename
 
 
 TEST_CHAT_ID = 1151534243
@@ -49,6 +58,8 @@ class FakeTelegram:
         """初始化消息列表。"""
         self.messages: list[tuple[int, str]] = []
         self.edits: list[tuple[int, int, str]] = []
+        self.menu_commands: list[dict[str, str]] | None = None
+        self.reply_markups: list[tuple[int, str, dict[str, Any]]] = []
 
     async def send_message(self, chat_id: int, text: str) -> dict[str, Any]:
         """记录发送消息并返回假的 Telegram message。"""
@@ -77,6 +88,49 @@ class FakeTelegram:
         """记录 Markdown 编辑，测试中按普通文本处理。"""
         await self.edit_message_text(chat_id, message_id, text)
 
+    async def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        """记录当前注册的 Bot 菜单。"""
+        self.menu_commands = commands
+
+    async def send_message_with_reply_markup(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict[str, Any],
+    ) -> dict[str, Any]:
+        """记录带按钮的消息发送。"""
+        self.reply_markups.append((chat_id, text, reply_markup))
+        self.messages.append((chat_id, text))
+        return {"message_id": len(self.messages)}
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        """测试中忽略 reply_markup 编辑。"""
+        _ = chat_id
+        _ = message_id
+        _ = reply_markup
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        """测试中忽略 callback 应答。"""
+        _ = callback_query_id
+        _ = text
+
+
+class FakeSession:
+    """记录发送到终端 session 的文本。"""
+
+    def __init__(self) -> None:
+        self.sent_texts: list[str] = []
+
+    async def async_send_text(self, text: str, suppress_broadcast: bool = False) -> None:
+        """记录发送到 session 的文本。"""
+        _ = suppress_broadcast
+        self.sent_texts.append(text)
+
 
 class FakeITerm:
     """记录测试中的 iTerm2 调用。"""
@@ -85,6 +139,15 @@ class FakeITerm:
         """初始化命令列表。"""
         self.commands: list[str] = []
         self.enter_count = 0
+        self.created_tab_count = 0
+        self.created_tab_activate_flags: list[bool] = []
+        self.target_session = FakeSession()
+        self.foreground_state: dict[str, Any] | None = None
+        self.command_results: list[Any] = []
+        self.closed_target_tab_count = 0
+        self.default_tab_cleared = False
+        self.simulate_stale_foreground_empty_output = False
+        self.wait_shell_ready_count = 0
 
     async def run_command_stream(
         self,
@@ -95,11 +158,53 @@ class FakeITerm:
         """记录普通命令输入。"""
         self.commands.append(command)
         await maybe_await(on_update("fake output"))
+        if self.simulate_stale_foreground_empty_output and self.foreground_state is not None:
+            return type("Result", (), {"exit_status": 0, "output": ""})()
+        if self.command_results:
+            return self.command_results.pop(0)
         return type("Result", (), {"exit_status": 0, "output": "fake output"})()
 
     async def send_enter(self) -> None:
         """记录发送回车。"""
         self.enter_count += 1
+
+    async def create_new_tab(self, activate: bool = True) -> int:
+        """记录新建 tab，并返回新的用户可见编号。"""
+        self.created_tab_count += 1
+        self.created_tab_activate_flags.append(activate)
+        return self.created_tab_count
+
+    async def get_target_session(self) -> FakeSession:
+        """返回假的当前目标 session。"""
+        return self.target_session
+
+    async def wait_until_shell_ready(self, timeout: float = 30.0) -> None:
+        """记录等待 shell prompt ready。"""
+        _ = timeout
+        self.wait_shell_ready_count += 1
+
+    def _set_foreground_state(
+        self,
+        session: FakeSession,
+        prompt_id: str | None,
+        command_name: str | None,
+    ) -> None:
+        """记录当前前台命令状态。"""
+        self.foreground_state = {
+            "session": session,
+            "prompt_id": prompt_id,
+            "command_name": command_name,
+        }
+
+    async def close_target_tab(self) -> None:
+        """记录关闭当前目标 tab，并清理前台状态。"""
+        self.closed_target_tab_count += 1
+        self.foreground_state = None
+        self.default_tab_cleared = True
+
+    def clear_default_tab(self) -> None:
+        """记录清除默认 tab 绑定。"""
+        self.default_tab_cleared = True
 
 
 class SequenceOutputController(ITermController):
@@ -123,6 +228,51 @@ class SequenceOutputController(ITermController):
         output = self._outputs[self._index]
         self._index += 1
         return output
+
+
+class SubmitProbeController(ITermController):
+    """只用于验证 send_foreground_input_stream 的发送序列。"""
+
+    def __init__(self, command_name: str) -> None:
+        super().__init__()
+        self.probe_session = FakeSession()
+        self._foreground_command_name = command_name
+
+    async def _wait_foreground_prompt_id(self, timeout: float = 2.0) -> tuple[Any, str | None]:
+        _ = timeout
+        return self.probe_session, "prompt-1"
+
+    async def _read_current_command_output_after_settle(
+        self,
+        session: Any,
+        prompt_id: str | None,
+    ) -> str:
+        _ = session
+        _ = prompt_id
+        return ""
+
+    async def _collect_foreground_delta(
+        self,
+        session: Any,
+        prompt_id: str,
+        before_output: str,
+        submitted_text: str,
+        is_interactive_cli: bool,
+        on_update: Any,
+        stream_interval: float,
+        idle_seconds: float,
+        before_ns: int = 0,
+    ) -> str:
+        _ = session
+        _ = prompt_id
+        _ = before_output
+        _ = submitted_text
+        _ = is_interactive_cli
+        _ = on_update
+        _ = stream_interval
+        _ = idle_seconds
+        _ = before_ns
+        return ""
 
 
 def assert_equal(actual: Any, expected: Any, message: str) -> None:
@@ -190,9 +340,19 @@ def build_unit_cases() -> list[TestCase]:
             func=test_unknown_slash_passthrough,
         ),
         TestCase(
+            name="shell_command_background_tab",
+            scenario="Shell 命令: 默认在后台新建并绑定独立 iTerm2 tab 执行",
+            func=test_shell_command_uses_background_tab,
+        ),
+        TestCase(
             name="enter_command",
             scenario="控制命令: /enter 只发送回车键，不走普通命令执行",
             func=test_enter_command,
+        ),
+        TestCase(
+            name="usage_refreshes_menu",
+            scenario="命令统计: 每次使用命令后都会异步刷新 Bot 菜单排序",
+            func=test_usage_refreshes_menu,
         ),
         TestCase(
             name="render_stream_message",
@@ -215,6 +375,101 @@ def build_unit_cases() -> list[TestCase]:
             func=test_claude_delta_anchor,
         ),
         TestCase(
+            name="opencode_launch_command",
+            scenario="OpenCode 启动命令: 新会话和旧会话都必须固定带上上下文目录参数",
+            func=test_opencode_launch_command,
+        ),
+        TestCase(
+            name="command_usage_sort",
+            scenario="菜单排序: 高频命令排在前面且同频保持原顺序",
+            func=test_command_usage_sort,
+        ),
+        TestCase(
+            name="telegram_command_passthrough",
+            scenario="Telegram 菜单注册: 传入排序后的命令列表时不能再额外前置固定命令",
+            func=test_telegram_command_passthrough,
+        ),
+        TestCase(
+            name="opencode_mode_menu",
+            scenario="OpenCode 交互模式: Bot 菜单应切换为精简专用命令集",
+            func=test_opencode_mode_menu,
+        ),
+        TestCase(
+            name="opencode_project_candidates",
+            scenario="OpenCode 项目列表: 合并数据库与手动项目，并按 bot 使用频率降序排序",
+            func=test_opencode_project_candidates,
+        ),
+        TestCase(
+            name="opencode_project_select_flow",
+            scenario="OpenCode 项目选择: 发送序号后应进入对应项目目录",
+            func=test_opencode_project_select_flow,
+        ),
+        TestCase(
+            name="opencode_project_add_flow",
+            scenario="OpenCode 项目添加: 手动添加目录后应持久化并直接进入项目",
+            func=test_opencode_project_add_flow,
+        ),
+        TestCase(
+            name="opencode_project_picker_layout",
+            scenario="OpenCode 项目列表: 支持分页，并按置顶/收藏/最近分组展示",
+            func=test_opencode_project_picker_layout,
+        ),
+        TestCase(
+            name="exit_closes_cli_tab",
+            scenario="CLI 退出: /exit 后应自动关闭当前绑定 tab 并清理目标绑定",
+            func=test_exit_closes_cli_tab,
+        ),
+        TestCase(
+            name="opencode_exit_then_shell_output",
+            scenario="OpenCode 退出后: 执行 shell 命令不应因为残留前台状态而变成空输出",
+            func=test_opencode_exit_then_shell_output,
+        ),
+        TestCase(
+            name="claude_mode_new_tab",
+            scenario="Claude 交互模式: 进入时应先新建并绑定独立 iTerm2 tab",
+            func=test_claude_mode_creates_new_tab,
+        ),
+        TestCase(
+            name="opencode_mode_new_tab",
+            scenario="OpenCode 交互模式: 进入时应先新建并绑定独立 iTerm2 tab",
+            func=test_opencode_mode_creates_new_tab,
+        ),
+        TestCase(
+            name="cursor_mode_screen_binding",
+            scenario="Cursor 交互模式: 进入时应直接绑定整屏前台会话，避免 prompt 状态丢失",
+            func=test_cursor_mode_uses_screen_binding,
+        ),
+        TestCase(
+            name="cursor_double_enter_submit",
+            scenario="Cursor 交互输入: 为稳定提交应发送双回车",
+            func=test_cursor_double_enter_submit,
+        ),
+        TestCase(
+            name="claude_invalid_resume_error",
+            scenario="Claude 会话恢复: 失效 resume 错误应被识别",
+            func=test_claude_invalid_resume_error,
+        ),
+        TestCase(
+            name="claude_silent_invalid_resume_fallback",
+            scenario="Claude 静默执行: 遇到失效 session_id 时应自动清理并重试新会话",
+            func=test_claude_silent_invalid_resume_fallback,
+        ),
+        TestCase(
+            name="claude_interactive_invalid_resume_fallback",
+            scenario="Claude 交互模式: 遇到失效 session_id 时应自动切换到新会话",
+            func=test_claude_interactive_invalid_resume_fallback,
+        ),
+        TestCase(
+            name="opencode_input_anchor",
+            scenario="OpenCode 输出切分: `┃` 输入回显行也能定位到本轮回答",
+            func=test_opencode_input_anchor,
+        ),
+        TestCase(
+            name="opencode_delta_clean",
+            scenario="OpenCode 文本清理: 输入栏、思考侧栏和底部状态栏不能进入最终回答",
+            func=test_opencode_delta_clean,
+        ),
+        TestCase(
             name="claude_repeated_input_anchor",
             scenario="Claude 输出切分: 答案里重复用户输入时不能从答案中间截断",
             func=test_claude_repeated_input_anchor,
@@ -223,6 +478,26 @@ def build_unit_cases() -> list[TestCase]:
             name="claude_empty_before_no_history",
             scenario="Claude 输出切分: before_output 偶发为空时不能返回上一轮历史",
             func=test_claude_empty_before_no_history,
+        ),
+        TestCase(
+            name="cursor_pasted_input_anchor",
+            scenario="Cursor 输出切分: iTerm2 粘贴回显前缀不能导致本轮回答丢失",
+            func=test_cursor_pasted_input_anchor,
+        ),
+        TestCase(
+            name="cursor_follow_up_complete",
+            scenario="Cursor 完成判断: Add a follow-up 和 system-reminder 尾屏仍应视为已完成",
+            func=test_cursor_follow_up_complete,
+        ),
+        TestCase(
+            name="cursor_system_reminder_not_answer",
+            scenario="Cursor 回答判断: 只有 system-reminder 时不能提前当成已拿到回答",
+            func=test_cursor_system_reminder_not_answer,
+        ),
+        TestCase(
+            name="cursor_composer_status_clean",
+            scenario="Cursor 文本清理: 无 Auto-run 的 Composer 状态栏也不能进入最终回答",
+            func=test_cursor_composer_status_clean,
         ),
         TestCase(
             name="prompt_output_settle",
@@ -326,7 +601,7 @@ def test_sanitize_filename() -> None:
 def test_image_path_prefix() -> None:
     """测试图片路径前置到下一条文本。"""
     app = Tg2ITermApp(
-        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5),
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
         telegram=FakeTelegram(),  # type: ignore[arg-type]
         iterm=FakeITerm(),  # type: ignore[arg-type]
     )
@@ -348,7 +623,7 @@ async def test_unauthorized_chat() -> None:
     telegram = FakeTelegram()
     iterm = FakeITerm()
     app = Tg2ITermApp(
-        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5),
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
         telegram=telegram,  # type: ignore[arg-type]
         iterm=iterm,  # type: ignore[arg-type]
     )
@@ -369,7 +644,7 @@ async def test_unknown_slash_passthrough() -> None:
     telegram = FakeTelegram()
     iterm = FakeITerm()
     app = Tg2ITermApp(
-        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5),
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
         telegram=telegram,  # type: ignore[arg-type]
         iterm=iterm,  # type: ignore[arg-type]
     )
@@ -382,6 +657,30 @@ async def test_unknown_slash_passthrough() -> None:
         ["/unknown_safe_command"],
         "未知斜杠文本应作为普通终端命令",
     )
+    assert_equal(iterm.created_tab_activate_flags, [False], "普通 shell 命令应在后台新建 tab 执行")
+
+
+async def test_shell_command_uses_background_tab() -> None:
+    """测试普通 shell 文本会在后台新建独立 tab 中执行。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    iterm.command_results = [type("Result", (), {"exit_status": 0, "output": "/Users/luca\n(base) luca@mbp tg2iterm2 %"})()]
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    await app._dispatch_text(TEST_CHAT_ID, "pwd")
+    await asyncio.sleep(0)
+    if app._command_task is not None:
+        await app._command_task
+    assert_equal(iterm.created_tab_count, 1, "普通 shell 命令前应先新建一个 tab")
+    assert_equal(iterm.created_tab_activate_flags, [False], "普通 shell 命令应在后台新建 tab，不切走当前可见 tab")
+    assert_equal(iterm.wait_shell_ready_count, 1, "普通 shell 命令执行前应先等待新 tab 中 shell prompt 就绪")
+    assert_equal(iterm.commands, ["pwd"], "普通 shell 文本应在新 tab 中执行")
+    assert_contains(telegram.messages[0][1], "当前绑定 tab：1", "执行中提示应回显绑定的 tab 编号")
+    assert_contains(telegram.edits[-1][2], "/Users/luca", "shell 最终输出应保留真实命令结果")
+    assert_true("(base) luca@mbp tg2iterm2 %" not in telegram.edits[-1][2], "shell 最终输出不应残留尾部 prompt")
 
 
 async def test_enter_command() -> None:
@@ -389,7 +688,7 @@ async def test_enter_command() -> None:
     telegram = FakeTelegram()
     iterm = FakeITerm()
     app = Tg2ITermApp(
-        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5),
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
         telegram=telegram,  # type: ignore[arg-type]
         iterm=iterm,  # type: ignore[arg-type]
     )
@@ -403,14 +702,49 @@ async def test_enter_command() -> None:
     )
 
 
+async def test_usage_refreshes_menu() -> None:
+    """测试记录命令使用后会立即异步刷新菜单。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    app._command_usage = {}
+    await app._dispatch_text(TEST_CHAT_ID, "/enter")
+    await asyncio.sleep(0)
+    if app._menu_update_task is not None:
+        await app._menu_update_task
+    assert_true(telegram.menu_commands is not None, "记录命令使用后应触发菜单刷新")
+    assert_equal(telegram.menu_commands[0]["command"], "enter", "最新高频命令应被刷新到菜单顶部")
+
+
 def test_render_stream_message() -> None:
     """测试 Telegram 命令响应格式。"""
     running = render_stream_message("pwd", "/tmp/workspace", finished=False)
     done = render_stream_message("echo", "hello-test-output", finished=True, exit_status=0)
+    shell_done = render_stream_message(
+        "pwd",
+        "/Users/luca\n(base) luca@mbp tg2iterm2 %",
+        finished=True,
+        exit_status=0,
+        strip_trailing_shell_prompt=True,
+    )
+    percent_done = render_stream_message(
+        "echo",
+        "完成率 95%",
+        finished=True,
+        exit_status=0,
+        strip_trailing_shell_prompt=True,
+    )
     assert_contains(running, "执行中", "执行中消息应标明状态")
     assert_contains(running, "/tmp/workspace", "执行中消息应包含输出内容")
     assert_contains(done, "已完成 exit=0", "完成消息应包含退出码")
     assert_contains(done, "hello-test-output", "完成消息应包含输出")
+    assert_contains(shell_done, "/Users/luca", "shell 输出应保留命令结果")
+    assert_true("(base) luca@mbp tg2iterm2 %" not in shell_done, "shell 输出应去掉尾部 prompt")
+    assert_contains(percent_done, "95%", "普通百分号文本不应被误删")
 
 
 def test_tab_number_parse() -> None:
@@ -447,6 +781,484 @@ def test_claude_delta_anchor() -> None:
     )
 
 
+def test_opencode_launch_command() -> None:
+    """测试 OpenCode 交互启动命令始终带上下文目录。"""
+    adapter = OpenCodeAdapter(Path("/tmp/opencode-context"))
+    expected = "opencode -c /tmp/opencode-context"
+    assert_equal(adapter.get_launch_command(None), expected, "新会话启动命令应带 -c 上下文目录")
+    assert_equal(adapter.get_launch_command("session-123"), expected, "已有会话时也应继续使用固定上下文目录")
+
+
+def test_command_usage_sort() -> None:
+    """测试命令菜单按使用频率降序排序。"""
+    commands = [
+        {"command": "help", "description": "帮助"},
+        {"command": "tabs", "description": "标签"},
+        {"command": "opencode", "description": "OpenCode"},
+        {"command": "new", "description": "新会话"},
+    ]
+    usage = {"opencode": 8, "tabs": 3, "new": 3}
+    sorted_commands = _sort_commands_by_usage(commands, usage)
+    assert_equal(
+        [item["command"] for item in sorted_commands],
+        ["opencode", "tabs", "new", "help"],
+        "高频命令应排前面，同频命令应保持原始顺序",
+    )
+
+
+async def test_telegram_command_passthrough() -> None:
+    """测试传入自定义命令列表时 Telegram 客户端不会再追加默认命令。"""
+
+    class RecordingTelegramClient(TelegramBotClient):
+        def __init__(self) -> None:
+            super().__init__("dummy-token")
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _request(self, method: str, payload: dict[str, Any]) -> Any:
+            self.calls.append((method, payload))
+            return True
+
+    client = RecordingTelegramClient()
+    custom_commands = [
+        {"command": "opencode", "description": "进入 OpenCode 模式"},
+        {"command": "tabs", "description": "列出 iTerm2 tab"},
+    ]
+    await client.set_my_commands(custom_commands)
+    method, payload = client.calls[-1]
+    assert_equal(method, "setMyCommands", "应调用 setMyCommands API")
+    assert_equal(payload["commands"], custom_commands, "自定义菜单顺序不应被默认命令前置打乱")
+
+
+async def test_opencode_mode_menu() -> None:
+    """测试 OpenCode 交互模式会注册精简 Bot 菜单。"""
+    telegram = FakeTelegram()
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=FakeITerm(),  # type: ignore[arg-type]
+    )
+    app._session_mode = SessionMode.OPENCODE
+    app._command_usage = {}
+    await app._update_bot_menu()
+    assert_equal(
+        telegram.menu_commands,
+        [
+            {"command": "opencode", "description": "进入 OpenCode 模式"},
+            {"command": "opencode_project", "description": "进入指定 OpenCode 项目"},
+            {"command": "new", "description": "重置当前 CLI 会话"},
+            {"command": "exit", "description": "退出当前 CLI 模式"},
+            {"command": "opencode_silent", "description": "OpenCode静默执行"},
+            {"command": "tabs", "description": "列出 iTerm2 tab"},
+        ],
+        "OpenCode 模式下应只显示精简专用菜单",
+    )
+
+
+def test_opencode_project_candidates() -> None:
+    """测试 OpenCode 项目列表会按本地使用频率排序。"""
+    old_projects_file = bot_module.OPENCODE_PROJECTS_FILE
+    old_read_recent = bot_module._read_recent_opencode_project_paths
+    with tempfile.TemporaryDirectory(prefix="tg2iterm2_opencode_projects_") as temp_dir:
+        projects_file = Path(temp_dir) / "opencode_projects.json"
+        try:
+            bot_module.OPENCODE_PROJECTS_FILE = projects_file
+            projects_file.write_text(json.dumps({
+                "manual_paths": ["/repo/manual"],
+                "usage": {"/repo/manual": 4, "/repo/db2": 6},
+                "aliases": {"/repo/manual": "手动项目"},
+            }))
+            bot_module._read_recent_opencode_project_paths = lambda limit=20: ["/repo/db1", "/repo/db2"]
+            candidates = bot_module._load_opencode_project_candidates(limit=10)
+            assert_equal(
+                candidates,
+                [
+                    {"path": "/repo/db2", "alias": "db2", "favorite": "0", "pinned": "0"},
+                    {"path": "/repo/manual", "alias": "手动项目", "favorite": "0", "pinned": "0"},
+                    {"path": "/repo/db1", "alias": "db1", "favorite": "0", "pinned": "0"},
+                ],
+                "项目列表应按 bot 侧使用频率降序排序，并保留数据库项目",
+            )
+        finally:
+            bot_module.OPENCODE_PROJECTS_FILE = old_projects_file
+            bot_module._read_recent_opencode_project_paths = old_read_recent
+
+
+async def test_opencode_project_select_flow() -> None:
+    """测试 OpenCode 项目选择后会进入对应项目。"""
+    old_projects_file = bot_module.OPENCODE_PROJECTS_FILE
+    old_read_recent = bot_module._read_recent_opencode_project_paths
+    entered: list[tuple[int, str, str]] = []
+    with tempfile.TemporaryDirectory(prefix="tg2iterm2_opencode_projects_") as temp_dir:
+        project_dir = Path(temp_dir) / "proj-a"
+        project_dir.mkdir()
+        try:
+            bot_module.OPENCODE_PROJECTS_FILE = Path(temp_dir) / "opencode_projects.json"
+            bot_module._read_recent_opencode_project_paths = lambda limit=20: [str(project_dir)]
+            telegram = FakeTelegram()
+            app = Tg2ITermApp(
+                config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+                telegram=telegram,  # type: ignore[arg-type]
+                iterm=FakeITerm(),  # type: ignore[arg-type]
+            )
+
+            async def fake_enter(chat_id: int, initial_prompt: str, context_dir: Path | None = None) -> None:
+                entered.append((chat_id, initial_prompt, str(context_dir)))
+
+            app._enter_opencode_interactive_mode = fake_enter  # type: ignore[method-assign]
+            await app._dispatch_text(TEST_CHAT_ID, "/opencode_project")
+            assert_equal(app._session_mode, SessionMode.OPENCODE_PROJECT_SELECT, "应进入 OpenCode 项目选择模式")
+            assert_contains(telegram.messages[-1][1], str(project_dir), "应向用户展示可选项目路径")
+            assert_true(bool(telegram.reply_markups), "项目选择应发送带按钮的消息")
+            await app._dispatch_text(TEST_CHAT_ID, "1")
+            assert_equal(entered, [(TEST_CHAT_ID, "", str(project_dir))], "发送序号后应进入对应项目目录")
+        finally:
+            bot_module.OPENCODE_PROJECTS_FILE = old_projects_file
+            bot_module._read_recent_opencode_project_paths = old_read_recent
+
+
+async def test_opencode_project_add_flow() -> None:
+    """测试手动添加 OpenCode 项目路径后会持久化并直接进入。"""
+    old_projects_file = bot_module.OPENCODE_PROJECTS_FILE
+    entered: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="tg2iterm2_opencode_projects_") as temp_dir:
+        project_dir = Path(temp_dir) / "proj-b"
+        project_dir.mkdir()
+        projects_file = Path(temp_dir) / "opencode_projects.json"
+        try:
+            bot_module.OPENCODE_PROJECTS_FILE = projects_file
+            telegram = FakeTelegram()
+            app = Tg2ITermApp(
+                config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+                telegram=telegram,  # type: ignore[arg-type]
+                iterm=FakeITerm(),  # type: ignore[arg-type]
+            )
+
+            async def fake_enter(chat_id: int, initial_prompt: str, context_dir: Path | None = None) -> None:
+                _ = chat_id
+                _ = initial_prompt
+                entered.append(str(context_dir))
+
+            app._enter_opencode_interactive_mode = fake_enter  # type: ignore[method-assign]
+            await app._dispatch_text(TEST_CHAT_ID, "/opencode_project_add")
+            assert_equal(app._session_mode, SessionMode.OPENCODE_PROJECT_ADD, "应进入 OpenCode 项目添加模式")
+            await app._dispatch_text(TEST_CHAT_ID, f"项目B | {project_dir}")
+            assert_equal(entered, [str(project_dir)], "手动添加后应直接进入对应项目目录")
+            saved = json.loads(projects_file.read_text())
+            assert_true(str(project_dir) in saved["manual_paths"], "手动添加的项目路径应被持久化")
+            assert_equal(saved["aliases"][str(project_dir)], "项目B", "手动添加的别名应被持久化")
+        finally:
+            bot_module.OPENCODE_PROJECTS_FILE = old_projects_file
+
+
+def test_opencode_project_picker_layout() -> None:
+    """测试项目选择器支持分组和分页。"""
+    projects = [
+        {"path": "/repo/pin", "alias": "置顶项目", "favorite": "0", "pinned": "1"},
+        {"path": "/repo/fav", "alias": "收藏项目", "favorite": "1", "pinned": "0"},
+        {"path": "/repo/recent1", "alias": "最近项目1", "favorite": "0", "pinned": "0"},
+        {"path": "/repo/recent2", "alias": "最近项目2", "favorite": "0", "pinned": "0"},
+        {"path": "/repo/recent3", "alias": "最近项目3", "favorite": "0", "pinned": "0"},
+    ]
+    text, markup = bot_module._build_opencode_project_picker(projects, page=0, page_size=3)
+    assert_contains(text, "【置顶项目】", "分页列表应显示置顶项目分组")
+    assert_contains(text, "【收藏项目】", "分页列表应显示收藏项目分组")
+    assert_contains(text, "【最近项目】", "分页列表应显示最近项目分组")
+    buttons = markup["inline_keyboard"]
+    flat_labels = [button["text"] for row in buttons for button in row]
+    assert_true(any("☆ 收藏" in label or "⭐ 取消收藏" in label for label in flat_labels), "列表中应提供收藏切换按钮")
+    assert_true(any("📍 置顶" in label or "📌 取消置顶" in label for label in flat_labels), "列表中应提供置顶切换按钮")
+    assert_true(any("下一页" in label for label in flat_labels), "超出单页容量时应提供分页按钮")
+
+
+async def test_exit_closes_cli_tab() -> None:
+    """测试交互 CLI 退出时会自动关闭当前绑定 tab。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    iterm._set_foreground_state(iterm.target_session, SCREEN_TEXT_PROMPT_ID, "opencode")
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    app._session_mode = SessionMode.OPENCODE
+    await app._exit_cli_mode(TEST_CHAT_ID)
+    assert_equal(iterm.closed_target_tab_count, 1, "/exit 后应自动关闭当前绑定的 CLI tab")
+    assert_equal(iterm.foreground_state, None, "关闭 CLI tab 后应清理前台状态")
+    assert_equal(app._session_mode, SessionMode.SHELL, "退出后应回到 Shell 模式")
+
+
+async def test_opencode_exit_then_shell_output() -> None:
+    """测试 OpenCode 退出后 shell 命令不会因为残留前台状态而空输出。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    iterm.simulate_stale_foreground_empty_output = True
+    iterm._set_foreground_state(iterm.target_session, SCREEN_TEXT_PROMPT_ID, "opencode")
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    app._session_mode = SessionMode.OPENCODE
+    await app._exit_cli_mode(TEST_CHAT_ID, silent=True)
+    await app._dispatch_text(TEST_CHAT_ID, "pwd")
+    await asyncio.sleep(0)
+    if app._command_task is not None:
+        await app._command_task
+    last_message = telegram.edits[-1][2] if telegram.edits else telegram.messages[-1][1]
+    assert_true("暂无输出" not in last_message, "退出 OpenCode 后 shell 命令不应再出现空输出")
+
+
+async def test_claude_mode_creates_new_tab() -> None:
+    """测试进入 Claude 模式时会先新建并绑定独立 tab。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    app._wait_for_claude_startup_state = lambda session, timeout=20.0: maybe_await("ready")  # type: ignore[method-assign]
+    await app._enter_cli_mode(TEST_CHAT_ID, SessionMode.CLAUDE, "")
+    assert_equal(iterm.created_tab_count, 1, "进入 Claude 模式前应先新建一个 tab")
+    assert_equal(iterm.created_tab_activate_flags, [False], "Claude 模式应在后台新建 tab，避免切走当前可见 tab")
+    assert_true(bool(iterm.target_session.sent_texts), "新 tab 内应启动 Claude CLI")
+    assert_contains(iterm.target_session.sent_texts[0], "claude", "启动命令应包含 claude")
+    assert_true(iterm.target_session.sent_texts[0].endswith("\r"), "Claude 启动命令应带回车发送")
+    assert_equal(
+        iterm.foreground_state,
+        {
+            "session": iterm.target_session,
+            "prompt_id": SCREEN_TEXT_PROMPT_ID,
+            "command_name": "claude",
+        },
+        "Claude 前台状态应绑定到整屏 session",
+    )
+    assert_contains(telegram.messages[-1][1], "当前绑定 tab：1", "进入 Claude 模式时应回显绑定的 tab 编号")
+
+
+async def test_opencode_mode_creates_new_tab() -> None:
+    """测试进入 OpenCode 模式时会先新建并绑定独立 tab。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    await app._enter_opencode_interactive_mode(TEST_CHAT_ID, "")
+    assert_equal(iterm.created_tab_count, 1, "进入 OpenCode 模式前应先新建一个 tab")
+    assert_equal(iterm.created_tab_activate_flags, [False], "OpenCode 模式应在后台新建 tab，避免切走当前可见 tab")
+    assert_true(bool(iterm.target_session.sent_texts), "新 tab 内应启动 OpenCode CLI")
+    assert_contains(iterm.target_session.sent_texts[0], "opencode -c", "启动命令应包含 opencode 上下文参数")
+    assert_true(iterm.target_session.sent_texts[0].endswith("\r"), "OpenCode 启动命令应带回车发送")
+    assert_contains(telegram.messages[-1][1], "当前绑定 tab：1", "进入 OpenCode 模式时应回显绑定的 tab 编号")
+    assert_equal(
+        iterm.foreground_state,
+        {
+            "session": iterm.target_session,
+            "prompt_id": SCREEN_TEXT_PROMPT_ID,
+            "command_name": "opencode",
+        },
+        "OpenCode 前台状态应绑定到新建 tab 的 session",
+    )
+
+
+async def test_cursor_mode_uses_screen_binding() -> None:
+    """测试进入 Cursor 模式时会绑定整屏前台状态。"""
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    app = Tg2ITermApp(
+        config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+        telegram=telegram,  # type: ignore[arg-type]
+        iterm=iterm,  # type: ignore[arg-type]
+    )
+    await app._enter_cli_mode(TEST_CHAT_ID, SessionMode.CURSOR, "")
+    assert_equal(iterm.created_tab_count, 1, "进入 Cursor 模式前应先新建一个 tab")
+    assert_equal(iterm.created_tab_activate_flags, [False], "Cursor 模式应在后台新建 tab，避免切走当前可见 tab")
+    assert_true(bool(iterm.target_session.sent_texts), "新 tab 内应启动 Cursor CLI")
+    assert_contains(iterm.target_session.sent_texts[0], "agent", "启动命令应包含 agent")
+    assert_true(iterm.target_session.sent_texts[0].endswith("\r"), "Cursor 启动命令应带回车发送")
+    assert_equal(
+        iterm.foreground_state,
+        {
+            "session": iterm.target_session,
+            "prompt_id": SCREEN_TEXT_PROMPT_ID,
+            "command_name": "agent",
+        },
+        "Cursor 前台状态应直接绑定到整屏 session",
+    )
+
+
+async def test_cursor_double_enter_submit() -> None:
+    """测试 Cursor Agent 发送时会追加双回车以稳定提交。"""
+    controller = SubmitProbeController("agent")
+
+    async def on_update(_output: str) -> None:
+        return None
+
+    await controller.send_foreground_input_stream(
+        text="hello",
+        on_update=on_update,
+        stream_interval=0.1,
+    )
+    assert_equal(
+        controller.probe_session.sent_texts,
+        ["hello", "\r", "\r"],
+        "Cursor Agent 输入应发送文本后双回车",
+    )
+
+
+def test_claude_invalid_resume_error() -> None:
+    """测试 Claude 失效 resume 错误识别。"""
+    assert_equal(
+        _is_invalid_claude_resume_error("No conversation found with session ID: 123"),
+        True,
+        "应识别 Claude 不存在的 session ID 错误",
+    )
+    assert_equal(
+        _is_invalid_claude_resume_error("some other error"),
+        False,
+        "其他错误不应被误判为 resume 失效",
+    )
+
+
+async def test_claude_silent_invalid_resume_fallback() -> None:
+    """测试 Claude 静默模式遇到失效会话时会自动重试新会话。"""
+    old_run_subprocess = bot_module._run_subprocess
+    old_read_session_id = bot_module._read_session_id
+    old_save_session_id = bot_module._save_session_id
+    old_clear_session_id = bot_module._clear_session_id
+    old_set_active_marker = bot_module._set_active_marker
+    old_sync_session_id_from_marker = bot_module._sync_session_id_from_marker
+    calls: list[list[str]] = []
+    cleared: list[SessionMode] = []
+    saved: list[tuple[SessionMode, str]] = []
+
+    async def fake_run_subprocess(args: list[str], timeout: float = 600.0) -> str:
+        _ = timeout
+        calls.append(args)
+        if "--resume" in args:
+            raise RuntimeError("No conversation found with session ID: dead-session")
+        return "fresh ok"
+
+    try:
+        bot_module._run_subprocess = fake_run_subprocess
+        bot_module._read_session_id = lambda mode: "dead-session" if mode == SessionMode.CLAUDE else None
+        bot_module._save_session_id = lambda mode, session_id: saved.append((mode, session_id))
+        bot_module._clear_session_id = lambda mode: cleared.append(mode)
+        bot_module._set_active_marker = lambda mode, active=True: None
+        bot_module._sync_session_id_from_marker = lambda mode: None
+
+        app = Tg2ITermApp(
+            config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+            telegram=FakeTelegram(),  # type: ignore[arg-type]
+            iterm=FakeITerm(),  # type: ignore[arg-type]
+        )
+        output = await app._run_claude_silent("hello")
+        assert_equal(output, "fresh ok", "失效会话后应自动回退到新会话执行")
+        assert_equal(cleared, [SessionMode.CLAUDE], "失效 resume 时应清掉已保存的 Claude session")
+        assert_true(any("--resume" in call for call in calls), "应先尝试 resume")
+        assert_true(any("--session-id" in call for call in calls), "resume 失败后应重试新会话")
+        assert_equal(saved[-1][0], SessionMode.CLAUDE, "新会话成功后应保存 Claude session")
+    finally:
+        bot_module._run_subprocess = old_run_subprocess
+        bot_module._read_session_id = old_read_session_id
+        bot_module._save_session_id = old_save_session_id
+        bot_module._clear_session_id = old_clear_session_id
+        bot_module._set_active_marker = old_set_active_marker
+        bot_module._sync_session_id_from_marker = old_sync_session_id_from_marker
+
+
+async def test_claude_interactive_invalid_resume_fallback() -> None:
+    """测试 Claude 交互模式遇到失效会话时会自动切换到新会话。"""
+    old_read_session_id = bot_module._read_session_id
+    old_clear_session_id = bot_module._clear_session_id
+    old_set_active_marker = bot_module._set_active_marker
+    cleared: list[SessionMode] = []
+    telegram = FakeTelegram()
+    iterm = FakeITerm()
+    send_calls: list[str] = []
+
+    startup_states = iter(["invalid_resume", "ready"])
+
+    async def fake_wait_for_claude_startup_state(_session: Any, timeout: float = 20.0) -> str:
+        _ = timeout
+        return next(startup_states)
+
+    async def fake_send_to_cli(_chat_id: int, text: str) -> None:
+        send_calls.append(text)
+
+    try:
+        bot_module._read_session_id = lambda mode: "dead-session" if mode == SessionMode.CLAUDE else None
+        bot_module._clear_session_id = lambda mode: cleared.append(mode)
+        bot_module._set_active_marker = lambda mode, active=True: None
+
+        app = Tg2ITermApp(
+            config=AppConfig("dummy", TEST_CHAT_ID, None, 0.1, "/tmp/tg2iterm2_claude_done", 300.0, "/tmp/tg2iterm2_perm_request.json", "/tmp/tg2iterm2_perm_response.json", 0.5, "/tmp/tg2iterm2_reminders.db"),
+            telegram=telegram,  # type: ignore[arg-type]
+            iterm=iterm,  # type: ignore[arg-type]
+        )
+        app._wait_for_claude_startup_state = fake_wait_for_claude_startup_state  # type: ignore[method-assign]
+        app._send_to_cli = fake_send_to_cli  # type: ignore[method-assign]
+        await app._enter_cli_mode(TEST_CHAT_ID, SessionMode.CLAUDE, "hello")
+        assert_equal(cleared, [SessionMode.CLAUDE], "交互模式 resume 失效时应清掉保存的 Claude session")
+        assert_equal(len(iterm.target_session.sent_texts), 2, "交互模式应在 resume 失败后立即重启新会话")
+        assert_contains(iterm.target_session.sent_texts[0], "--resume dead-session", "第一次应先尝试恢复旧会话")
+        assert_equal(iterm.target_session.sent_texts[1], "claude\r", "恢复失败后应直接启动全新 Claude 会话")
+        assert_equal(send_calls, ["hello"], "首条消息应在新会话就绪后再发送给 Claude")
+        assert_contains(
+            "\n".join(text for _chat_id, text in telegram.messages),
+            "已自动切换到新会话",
+            "恢复失败后应提示用户已自动切到新会话",
+        )
+    finally:
+        bot_module._read_session_id = old_read_session_id
+        bot_module._clear_session_id = old_clear_session_id
+        bot_module._set_active_marker = old_set_active_marker
+
+
+def test_opencode_input_anchor() -> None:
+    """测试 OpenCode 的 `┃` 输入回显行也能作为本轮锚点。"""
+    before = (
+        "  ┃  hello\n"
+        "  ┃\n\n"
+        "     Hello.\n\n"
+        "     ▣  Build · GPT-5.4 · 3.1s\n"
+    )
+    current = (
+        before
+        + "  ┃  hello\n"
+        + "  ┃\n\n"
+        + "  ┃  Thinking: Responding to greetings\n"
+        + '  ┃  I need to provide a simple greeting.\n\n'
+        + "     Hello.\n\n"
+        + "     ▣  Build · GPT-5.4 · 4.2s\n"
+        + "  ╹▀▀▀▀▀▀▀▀▀▀▀▀\n"
+        + "   ⬝⬝⬝⬝⬝■■■  esc interrupt\n"
+    )
+    delta = output_after(before, current, "hello")
+    assert_contains(delta, "Thinking: Responding to greetings", "应从最新一轮 OpenCode 输入之后开始截取")
+    cleaned = _clean_opencode_delta(delta)
+    assert_equal(cleaned, "Hello.", "最终输出应只保留 OpenCode 正文回答")
+
+
+def test_opencode_delta_clean() -> None:
+    """测试 OpenCode 清理逻辑会移除侧栏和状态栏噪声。"""
+    delta = (
+        "  ┃  hello\n"
+        "  ┃\n\n"
+        "  ┃  Thinking: Responding to greetings\n"
+        "  ┃  I need to provide a simple greeting.\n\n"
+        "     Hello.\n\n"
+        "     ▣  Build · GPT-5.4 · 4.2s\n"
+        "  ╹▀▀▀▀▀▀▀▀▀▀▀▀\n"
+        "   ⬝⬝⬝⬝⬝■■■  esc interrupt\n"
+    )
+    cleaned = _clean_opencode_delta(delta)
+    assert_equal(cleaned, "Hello.", "OpenCode 最终输出应去掉输入栏和思考栏")
+    assert_equal(_has_opencode_answer(delta), True, "含正文回答时应识别为 OpenCode 已有答案")
+
+
 def test_claude_repeated_input_anchor() -> None:
     """测试答案重复用户输入时不从答案中间截断。"""
     before = "❯ old\n\n⏺ old answer\n\n✻ Sautéed for 2s\n\n❯\n"
@@ -472,6 +1284,74 @@ def test_claude_empty_before_no_history() -> None:
         output_after("", previous_output, "数值计算"),
         "",
         "没有本轮输入锚点时不能把上一轮输出当成本轮结果",
+    )
+
+
+def test_cursor_pasted_input_anchor() -> None:
+    """测试 Cursor 的 iTerm2 粘贴回显行仍能定位本轮输入锚点。"""
+    before = "欢迎来到 Cursor\n\n>\n"
+    current = (
+        before
+        + "[Pasted ~4 linehello\n\n"
+        + "  你好，Hello。今天想聊点什么，还是有什么任务要一起处理？\n\n"
+        + ">\n"
+    )
+    delta = output_after(before, current, "hello")
+    assert_contains(delta, "你好，Hello。", "粘贴回显前缀后仍应提取到 Cursor 回答")
+    assert_not_contains(delta, "[Pasted", "本轮输出不应把粘贴回显噪声带给 Telegram")
+
+
+def test_cursor_follow_up_complete() -> None:
+    """测试 Cursor 回到 follow-up UI 时应视为完成，并清理 reminder 噪声。"""
+    screen = (
+        "[Pasted ~11hello\n\n"
+        "  你好。有什么我可以帮你的？\n\n"
+        "<system-reminder>\n"
+        "Your operational mode has changed from plan to build.\n"
+        "You are no longer in read-only mode.\n"
+        "You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.\n"
+        "</system-reminder>\n\n"
+        "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+        "  → Add a follow-up\n"
+        "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+        "  Composer 2 Fast · 24.5%                                                                                                                                                                            Auto-run\n"
+        "  ~\n"
+    )
+    delta = output_after("", screen, "hello")
+    assert_true(_has_cursor_ready_state(screen), "出现 follow-up UI 时应认为 Cursor 已回到可继续追问状态")
+    assert_true(_has_cursor_answer(delta), "真实回答样例应被识别为已有答案")
+    cleaned = _clean_generic_delta(delta)
+    assert_contains(cleaned, "你好。有什么我可以帮你的？", "应保留 Cursor 的正文回答")
+    assert_not_contains(cleaned, "system-reminder", "最终输出不应包含 system-reminder 标签")
+    assert_not_contains(cleaned, "Add a follow-up", "最终输出不应包含后续追问 UI")
+    assert_not_contains(cleaned, "Composer 2 Fast", "最终输出不应包含底部状态栏")
+
+
+def test_cursor_system_reminder_not_answer() -> None:
+    """测试只有 system-reminder 时不能算 Cursor 回答。"""
+    delta = (
+        "<system-reminder>\n"
+        "Your operational mode has changed from plan to build.\n"
+        "You are no longer in read-only mode.\n"
+        "You are permitted to make file changes, run shell commands, and utilize your arsenal of tools as needed.\n"
+        "</system-reminder>\n"
+    )
+    assert_equal(_clean_generic_delta(delta), "", "system-reminder 不应成为最终输出")
+    assert_equal(_has_cursor_answer(delta), False, "system-reminder 不能被当成 Cursor 正文回答")
+
+
+def test_cursor_composer_status_clean() -> None:
+    """测试 Cursor 的 Composer 百分比状态栏不会进入最终回答。"""
+    delta = (
+        "你好，有什么需要帮忙的吗？可以是写代码、查文档、调试问题，或其他技术相关的事情。\n\n"
+        "  Composer 2 Fast · 12.7%\n"
+        "  ~\n"
+    )
+    cleaned = _clean_generic_delta(delta)
+    assert_equal(
+        cleaned,
+        "你好，有什么需要帮忙的吗？可以是写代码、查文档、调试问题，或其他技术相关的事情。",
+        "Composer 百分比状态栏不应污染最终 Cursor 输出",
     )
 
 
@@ -904,11 +1784,17 @@ def parse_args() -> argparse.Namespace:
 async def main() -> None:
     """运行测试主入口。"""
     args = parse_args()
-    await run_cases(build_unit_cases())
-    if args.iterm:
-        await run_iterm_safe_tests()
-    if args.claude:
-        await run_claude_safe_test()
+    old_command_usage_file = bot_module.COMMAND_USAGE_FILE
+    with tempfile.TemporaryDirectory(prefix="tg2iterm2_test_") as temp_dir:
+        bot_module.COMMAND_USAGE_FILE = Path(temp_dir) / "command_usage.json"
+        try:
+            await run_cases(build_unit_cases())
+            if args.iterm:
+                await run_iterm_safe_tests()
+            if args.claude:
+                await run_claude_safe_test()
+        finally:
+            bot_module.COMMAND_USAGE_FILE = old_command_usage_file
     print("全部测试通过")
 
 

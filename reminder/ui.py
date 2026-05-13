@@ -79,7 +79,6 @@ def build_reminder_list_keyboard(
             text = reminder.content[:20]
         keyboard.append([
             {"text": text, "callback_data": f"reminder_detail_{reminder.id}"},
-            {"text": "🗑️", "callback_data": f"reminder_delete_{reminder.id}"},
         ])
 
     # 翻页按钮

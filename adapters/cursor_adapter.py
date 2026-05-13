@@ -20,6 +20,7 @@ CURSOR_DONE_SIGNAL_DEFAULT = Path("/tmp/tg2iterm2_cursor_done")
 
 CURSOR_THINKING_RE = re.compile(r"^\s*Thinking\s*\.{3}\s*$", re.IGNORECASE)
 CURSOR_TOOL_CALL_RE = re.compile(r"^\s*(?:Running|Executing)\s+.+$", re.IGNORECASE)
+CURSOR_COMPOSER_STATUS_RE = re.compile(r"^Composer\b.*$", re.IGNORECASE)
 
 SKILLS_DIR = Path.home() / ".cursor" / "skills"
 
@@ -188,6 +189,8 @@ def _is_noise_line(stripped: str) -> bool:
     if CURSOR_THINKING_RE.match(stripped):
         return True
     if CURSOR_TOOL_CALL_RE.match(stripped):
+        return True
+    if CURSOR_COMPOSER_STATUS_RE.match(stripped):
         return True
     return False
 
